@@ -6,6 +6,7 @@ from .example_broker import ExampleBroker
 from .interactive_brokers import InteractiveBrokers
 from .interactive_brokers_rest import InteractiveBrokersREST
 from .projectx import ProjectX
+from .qmt_bridge_broker import QMTBridgeBroker
 from .schwab import Schwab
 from .tradier import Tradier
 from .tradovate import Tradovate

@@ -18,5 +18,6 @@ from .yahoo_data import YahooData
 
 from .databento_data import DataBentoData, DataBentoDataPandas, DataBentoDataPolars
 from .projectx_data import ProjectXData
+from .qmt_bridge_data import QMTBridgeData
 
 from ..backtesting.polygon_backtesting import PolygonDataBacktesting
