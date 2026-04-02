@@ -270,9 +270,13 @@ class Data:
         # PERF: `get_bars()` slices and then selects OHLCV columns on every call. Cache a stable
         # OHLCV view once (initialized lazily after `repair_times_and_fill()` so it reflects any
         # NaN filling performed there).
+        # NOTE: Include preClose column for data sources like QMT Bridge that provide it for
+        # accurate gap calculation. preClose is a reference column (not aggregated during resample).
         bars_cols = ["open", "high", "low", "close", "volume"]
         if "dividend" in self.df.columns:
             bars_cols.append("dividend")
+        if "preClose" in self.df.columns:
+            bars_cols.append("preClose")
         self._bars_cols = [c for c in bars_cols if c in self.df.columns]
         self._bars_df = None
         # PERF: `get_bars()` performs repeated `col in df.columns` membership checks which go
@@ -558,6 +562,7 @@ class Data:
         # with NaNs in open/high/low but expect them to be filled from close).
         try:
             # Update cached column list if we added derived columns above.
+            # NOTE: Include preClose column for data sources like QMT Bridge that provide it.
             bars_cols = ["open", "high", "low", "close", "volume"]
             if "dividend" in self.df.columns:
                 bars_cols.append("dividend")
@@ -567,6 +572,9 @@ class Data:
             else:
                 if "return" in self.df.columns:
                     bars_cols.append("return")
+            # Preserve preClose if present (for accurate gap calculation)
+            if "preClose" in self.df.columns:
+                bars_cols.append("preClose")
 
             self._bars_cols = [c for c in bars_cols if c in self.df.columns]
             if self._bars_cols:

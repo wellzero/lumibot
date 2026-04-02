@@ -663,7 +663,6 @@ class QMTBridgeBroker(Broker):
             try:
                 # Subscribe to trade event callbacks
                 client.subscribe_trade_events(
-                    account_id=self.account_id,
                     callback=self._on_trade_event_callback,
                 )
                 self._stream_established()

@@ -9,7 +9,7 @@
 import os
 import sys
 
-from .brokers import Alpaca, Ccxt, InteractiveBrokers, InteractiveBrokersREST, Tradier, Tradovate, Schwab, Bitunix, ProjectX
+from .brokers import QMTBridgeBroker, Alpaca, Ccxt, InteractiveBrokers, InteractiveBrokersREST, Tradier, Tradovate, Schwab, Bitunix, ProjectX
 from dotenv import load_dotenv
 import termcolor
 from dateutil import parser
@@ -364,6 +364,14 @@ BITUNIX_CONFIG = {
     "TRADING_MODE": os.environ.get("BITUNIX_TRADING_MODE", "FUTURES"), # Add TRADING_MODE, default to FUTURES
 }
 
+# QMT Configuration
+QMT_BRIDGE_CONFIG = {
+    "HOST": os.getenv("QMT_BRIDGE_HOST", "localhost"),
+    "PORT":  int(os.getenv("QMT_BRIDGE_PORT", "8083")),
+    "API_KEY":  os.getenv("QMT_BRIDGE_API_KEY", ""),
+    "ACCOUNT_ID": os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
+}
+
 # ProjectX URL mappings - REST API base URLs (v2 gateway URLs preferred)
 PROJECTX_BASE_URLS = {
     "topstepx": "https://api.topstepx.com/",
@@ -496,6 +504,10 @@ if not is_backtesting or is_backtesting.lower() == "false":
             broker = Schwab(SCHWAB_CONFIG)
         elif trading_broker_name.lower() == "bitunix":
             broker = Bitunix(BITUNIX_CONFIG)
+        elif trading_broker_name.lower() == "qmt_bridge":
+            from .data_sources import QMTBridgeData
+            qmt_data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
+            broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
         elif trading_broker_name.lower() == "projectx":
             try:
                 # Get specified firm or use auto-detection
@@ -602,6 +614,10 @@ if not is_backtesting or is_backtesting.lower() == "false":
             broker = Ccxt(KRAKEN_CONFIG)
         elif BITUNIX_CONFIG["API_KEY"] and BITUNIX_CONFIG["API_SECRET"]:
             broker = Bitunix(BITUNIX_CONFIG)
+        elif QMT_BRIDGE_CONFIG["ACCOUNT_ID"]:
+            from .data_sources import QMTBridgeData
+            qmt_data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
+            broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
         elif get_available_projectx_firms():
             try:
                 # Use first available ProjectX firm
@@ -644,6 +660,9 @@ if not is_backtesting or is_backtesting.lower() == "false":
             elif data_source_name.lower() == "polygon":
                 from .data_sources import PolygonData
                 data_source = PolygonData(api_key=POLYGON_API_KEY)
+            elif data_source_name.lower() == "qmt_bridge":
+                from .data_sources import QMTBridgeData
+                data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
             elif data_source_name.lower() == "yahoo":
                 from .data_sources import YahooData
                 

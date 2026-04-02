@@ -28,7 +28,7 @@ import pytz
 
 from lumibot.constants import LUMIBOT_DEFAULT_TIMEZONE
 from lumibot.data_sources.data_source import DataSource
-from lumibot.entities import Asset, Bars, Quote
+from lumibot.entities import Asset, Bars, Data, Quote
 from lumibot.tools.lumibot_logger import get_logger
 
 logger = get_logger(__name__)
@@ -342,7 +342,7 @@ class QMTBridgeData(DataSource):
             # Get more bars than needed to ensure we have enough after filtering
             fetch_count = length * 2
 
-            # Format dates for QMT (YYYYMMDD)
+            # Format dates for QMT (YYYYMMDDHHMMSS)
             end_time = end_dt.strftime("%Y%m%d%H%M%S")
             start_dt = end_dt - timedelta(days=length * 3)  # Buffer for weekends/holidays
             start_time = start_dt.strftime("%Y%m%d%H%M%S")
@@ -353,7 +353,7 @@ class QMTBridgeData(DataSource):
                 period=qmt_period,
                 start_time=start_time,
                 end_time=end_time,
-                count=fetch_count,
+                count=-1,  # Get all data in range
                 dividend_type=self.dividend_type,
                 fill_data=self.fill_data,
             )
@@ -368,37 +368,36 @@ class QMTBridgeData(DataSource):
                 logger.warning(f"Empty DataFrame returned for {symbol}")
                 return None
 
-            # Ensure we have the required columns
-            required_cols = ["open", "high", "low", "close", "volume"]
-            available_cols = [col.lower() for col in df.columns]
+            # QMT Bridge returns DataFrame with columns: time, open, high, low, close, volume, etc.
+            # The 'time' column is in milliseconds since epoch
 
-            # Map column names (case-insensitive)
-            col_mapping = {col.lower(): col for col in df.columns}
-
-            # Build normalized DataFrame
+            # Build normalized DataFrame with required columns
             normalized_data = {}
-            for req_col in required_cols:
-                if req_col in available_cols:
-                    normalized_data[req_col] = df[col_mapping[req_col]]
+
+            # Handle time/index
+            if "time" in df.columns:
+                # QMT returns time as timestamp in milliseconds
+                normalized_data["time"] = pd.to_datetime(df["time"], unit="ms")
+            elif "index" in df.columns:
+                normalized_data["time"] = pd.to_datetime(df["index"])
+            else:
+                # Try to use the index if it's datetime-like
+                normalized_data["time"] = pd.to_datetime(df.index)
+
+            # Get OHLCV columns (case-insensitive)
+            for col in ["open", "high", "low", "close", "volume"]:
+                col_mapping = {c.lower(): c for c in df.columns}
+                if col in col_mapping:
+                    normalized_data[col] = df[col_mapping[col]]
                 else:
-                    logger.warning(f"Missing column '{req_col}' in historical data")
-                    normalized_data[req_col] = 0
+                    logger.warning(f"Missing column '{col}' in historical data for {symbol}")
+                    normalized_data[col] = 0
 
             # Create DataFrame with normalized columns
             normalized_df = pd.DataFrame(normalized_data)
 
-            # Handle date/time index
-            if "time" in df.columns:
-                # QMT returns time as timestamp
-                normalized_df.index = pd.to_datetime(df["time"], unit="ms")
-            elif df.index.name == "date" or isinstance(df.index, pd.DatetimeIndex):
-                normalized_df.index = df.index
-            else:
-                normalized_df.index = pd.date_range(
-                    start=start_dt,
-                    periods=len(normalized_df),
-                    freq=self._get_pandas_freq(timestep or "day")
-                )
+            # Set time as index
+            normalized_df.set_index("time", inplace=True)
 
             # Localize index if not already timezone-aware
             if normalized_df.index.tz is None:
@@ -406,7 +405,10 @@ class QMTBridgeData(DataSource):
             else:
                 normalized_df.index = normalized_df.index.tz_convert(self.tzinfo)
 
-            # Take only the requested number of bars
+            # Sort by index (oldest first)
+            normalized_df.sort_index(inplace=True)
+
+            # Take only the requested number of bars (most recent)
             if len(normalized_df) > length:
                 normalized_df = normalized_df.iloc[-length:]
 
@@ -422,6 +424,8 @@ class QMTBridgeData(DataSource):
 
         except Exception as e:
             logger.error(f"Error fetching historical prices for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def _get_pandas_freq(self, timestep: str) -> str:
@@ -609,3 +613,139 @@ class QMTBridgeData(DataSource):
         except Exception as e:
             logger.error(f"Error fetching market snapshot: {e}")
             return {}
+
+
+def get_qmt_symbols_historical_price(
+    symbols: list,
+    start_date: str,
+    end_date: str,
+    host: str,
+    port: int,
+    api_key: str,
+    dividend_type: str = "back",
+    lookback_days: int = 60,
+):
+    """Fetch historical daily data from QMT Bridge for multiple symbols.
+
+    Creates a :class:`Data` object for each symbol suitable for use with
+    :class:`~lumibot.backtesting.PandasDataBacktesting`.
+
+    Parameters
+    ----------
+    symbols : list[str]
+        Stock symbols in QMT format (e.g. ``"000001.SZ"``, ``"600519.SH"``).
+    start_date : str
+        Backtest start date in ``'YYYY-MM-DD'`` format.
+    end_date : str
+        Backtest end date in ``'YYYY-MM-DD'`` format.
+    host : str
+        QMT Bridge server host.
+    port : int
+        QMT Bridge server port.
+    api_key : str
+        API key for authentication.
+    dividend_type : str, optional
+        Dividend adjustment type: ``"none"``, ``"front"`` (forward),
+        ``"back"`` (backward), ``"front_ratio"``, ``"back_ratio"``.
+        Default is ``"front"``.
+    lookback_days : int, optional
+        Extra calendar days to look back before *start_date* for indicator
+        warm-up.  Default is 60.
+
+    Returns
+    -------
+    dict
+        Mapping of :class:`~lumibot.entities.Asset` → :class:`~lumibot.entities.Data`.
+    """
+    fetch_start = (pd.to_datetime(start_date) - timedelta(days=lookback_days + 50)).strftime("%Y%m%d")
+    fetch_end = pd.to_datetime(end_date).strftime("%Y%m%d")
+
+    pandas_data = {}
+    quote = Asset(symbol="USD", asset_type="forex")
+
+    logger.info("Fetching data from QMT Bridge for %d symbols (%s ~ %s)", len(symbols), fetch_start, fetch_end)
+
+    data_source = QMTBridgeData(
+        host=host,
+        port=port,
+        api_key=api_key,
+        dividend_type=dividend_type,
+        fill_data=True,
+    )
+
+    client = data_source._get_client()
+
+    try:
+        # Step 1: Download data to local storage in batches
+        total_symbols = len(symbols)
+        batch_size = 10
+        logger.info("Downloading data in batches of %d...", batch_size)
+
+        for i in range(0, total_symbols, batch_size):
+            batch = symbols[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (total_symbols + batch_size - 1) // batch_size
+            logger.info("  Downloading batch %d/%d (%d symbols)...", batch_num, total_batches, len(batch))
+
+            for symbol in batch:
+                try:
+                    client.download(symbol, "1d", start=start_date, end=end_date)
+                except Exception as e:
+                    logger.debug("    Download skipped for %s: %s", symbol, e)
+
+        # Step 2: Load data from local storage
+        logger.info("Loading historical data from local storage...")
+        result = client.get_local_data(
+            stocks=symbols,
+            period="1d",
+            start_time=fetch_start,
+            end_time=fetch_end,
+            dividend_type=dividend_type,
+        )
+
+        for symbol in symbols:
+            try:
+                asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
+
+                if symbol in result and result[symbol] is not None and not result[symbol].empty:
+                    df = result[symbol]
+
+                    if "time" in df.columns:
+                        df = df.copy()
+                        df["time"] = pd.to_datetime(df["time"], unit="ms")
+                        df.set_index("time", inplace=True)
+                    elif "index" in df.columns:
+                        df = df.copy()
+                        df["time"] = pd.to_datetime(df["index"])
+                        df.set_index("time", inplace=True)
+
+                    if df.index.tz is None:
+                        df.index = df.index.tz_localize("Asia/Shanghai")
+
+                    required_cols = ["open", "high", "low", "close", "volume"]
+                    keep_cols = [c for c in required_cols if c in df.columns]
+                    df = df[keep_cols]
+
+                    if len(df) > 0:
+                        pandas_data[asset] = Data(
+                            asset=asset,
+                            df=df,
+                            timestep="day",
+                            quote=quote,
+                        )
+                        logger.info("  Loaded %s: %d bars", symbol, len(df))
+                    else:
+                        logger.warning("  No data for %s", symbol)
+                else:
+                    logger.warning("  No data for %s", symbol)
+
+            except Exception as e:
+                logger.error("  Error processing %s: %s", symbol, e)
+
+    except Exception as e:
+        logger.error("Error fetching batch data: %s", e)
+        import traceback
+        traceback.print_exc()
+
+    logger.info("Successfully loaded data for %d/%d symbols", len(pandas_data), len(symbols))
+    return pandas_data
