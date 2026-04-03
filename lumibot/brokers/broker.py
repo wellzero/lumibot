@@ -1592,9 +1592,15 @@ class Broker(ABC):
 
         row = 0 if not next else 1
         th = trading_hours.iloc[row, :]
-        market_open, market_close = th.iloc[0], th.iloc[1]
 
-        print(f"market {market} market_open {market_open}, market_close {market_close}")
+        if self.market == "SSE":
+            # Use named columns instead of positional iloc — some markets (e.g. SSE)
+            # have extra columns (break_start, break_end) so iloc[1] would return
+            # break_start instead of market_close.
+            market_open = th["market_open"]
+            market_close = th["market_close"]
+        else:
+            market_open, market_close = th.iloc[0], th.iloc[1]
 
         if close:
             return market_close + timedelta(minutes=self.extended_trading_minutes)
@@ -1706,6 +1712,7 @@ class Broker(ABC):
         if self._is_continuous_market(self.market):
             
             return True
+
         current_time = datetime.now(timezone.utc).astimezone(tz=tz.tzlocal())
 
         # For ANY market, check both today's and tomorrow's sessions since trading sessions 
@@ -1717,7 +1724,6 @@ class Broker(ABC):
             open_time_today = self.utc_to_local(self.market_hours(close=False, next=False))
             close_time_today = self.utc_to_local(self.market_hours(close=True, next=False))
             
-            print(f"open_time_today: {open_time_today}, close_time_today: {close_time_today} current_time: {current_time}")
             if (current_time >= open_time_today) and (close_time_today >= current_time):
                 return True
         except:

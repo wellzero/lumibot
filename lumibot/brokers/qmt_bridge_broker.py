@@ -122,12 +122,9 @@ class QMTBridgeBroker(Broker):
         self.account_id = account_id
         self._client = None
 
-        # Set market for Chinese exchanges
-        # Use 24/7 so lumibot does not gate iterations on exchange hours.
-        # A-share live session is 9:30-11:30 / 13:00-15:00 CST; the strategy
-        # itself is responsible for checking time if it needs finer control.
+        # Set market for Chinese exchanges (Shanghai Stock Exchange)
         config = kwargs.get("config", {}) or {}
-        config["MARKET"] = config.get("MARKET", "24/7")
+        config["MARKET"] = config.get("MARKET", "SSE")
 
         super().__init__(
             name="qmt_bridge",
