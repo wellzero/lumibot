@@ -441,6 +441,12 @@ if __name__ == "__main__":
     backtesting_start_date = '2022-01-01'
     backtesting_end_date = '2024-12-31'
 
+    # Calculate data loading start date with lookback period
+    # Strategy needs ~60 days of lookback for volume average calculation
+    lookback_period = 60
+    data_loading_start = pd.to_datetime(backtesting_start_date) - pd.Timedelta(days=lookback_period + 50)
+    data_loading_start_str = data_loading_start.strftime('%Y-%m-%d')
+
     test_date = datetime.now().strftime('%Y-%m-%d')
     quant_data_dir = os.getenv("QUANT_DATA_DIR", "/home/quant_volumn/quant_data")
     execution_folder_path = f"{quant_data_dir}/html/backtest/{test_date}/cn_policy_gap_retail_reversal"
@@ -457,18 +463,19 @@ if __name__ == "__main__":
     print(f"QMT Bridge Port: {qmt_port}")
     print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
     print(f"Symbols: {len(symbols_to_backtest)}")
+    print(f"Data loading from: {data_loading_start_str} (includes {lookback_period}+50 days lookback)")
     print(f"Backtest period: {backtesting_start_date} to {backtesting_end_date}")
     print("=" * 60)
 
-    # Fetch data from QMT Bridge
+    # Fetch data from QMT Bridge with lookback period
     pandas_data = get_qmt_symbols_historical_price(
         symbols=symbols_to_backtest,
-        start_date=backtesting_start_date,
+        start_date=data_loading_start_str,
         end_date=backtesting_end_date,
         host=qmt_host,
         port=qmt_port,
         api_key=qmt_api_key,
-        dividend_type='front'
+        dividend_type='back'  # Use forward adjustment (QFQ/前复权) to match original data source
     )
 
     if not pandas_data:

@@ -444,11 +444,18 @@ if __name__ == "__main__":
         "daily_loss_limit": 0.03,
         "rebalance_freq": "daily",
     }
+    IS_BACKTESTING = True
 
     # ── Backtest mode ───────────────────────────────────────────────────────
     if IS_BACKTESTING:
         backtesting_start_date = '2022-01-01'
         backtesting_end_date = '2024-12-31'
+
+        # Calculate data loading start date with lookback period
+        # Strategy needs ~60 days of lookback for volume average calculation
+        lookback_period = 60
+        data_loading_start = pd.to_datetime(backtesting_start_date) - pd.Timedelta(days=lookback_period + 50)
+        data_loading_start_str = data_loading_start.strftime('%Y-%m-%d')
 
         test_date = datetime.now().strftime('%Y-%m-%d')
         quant_data_dir = "/home/quant_volumn/quant_data"
@@ -466,6 +473,7 @@ if __name__ == "__main__":
         print(f"QMT Bridge Port: {qmt_port}")
         print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
         print(f"Symbols: {len(symbols_to_trade)}")
+        print(f"Data loading from: {data_loading_start_str} (includes {lookback_period}+50 days lookback)")
         print(f"Backtest period: {backtesting_start_date} to {backtesting_end_date}")
         print("=" * 60)
 
@@ -487,6 +495,7 @@ if __name__ == "__main__":
                 "port": qmt_port,
                 "api_key": qmt_api_key,
                 "symbols": symbols_to_trade,
+                "dividend_type": "back"  # Use forward adjustment (QFQ/前复权) to match original data source
             },
             parameters=strategy_params,
         )

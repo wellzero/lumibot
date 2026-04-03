@@ -434,7 +434,7 @@ if __name__ == "__main__":
         start_date=data_loading_start_str,
         end_date=backtesting_end_date,
         column_option="all",
-        dir_option='xtq'
+        dir_option='xq'
     )
     
     pandas_data_for_backtest = {}

@@ -6,6 +6,11 @@ historical data from QMT Bridge and feeds it into the backtesting framework.
 It follows the same pattern as YahooDataBacktesting but fetches data from
 the QMT Bridge API for Chinese A-shares.
 
+IMPORTANT: This module provides a factory that returns PandasDataBacktesting
+instances so that strategy_executor.py recognizes them as valid pandas daily
+data sources (the check uses type().__name__ which must be "PandasData" or
+"PandasDataBacktesting").
+
 Example
 -------
 >>> from lumibot.backtesting import QMTBridgeDataBacktesting
@@ -22,16 +27,20 @@ Example
 ... )
 """
 
-from lumibot.data_sources.pandas_data import PandasData
+from lumibot.backtesting.pandas_backtesting import PandasDataBacktesting
 from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
 
 
-class QMTBridgeDataBacktesting(PandasData):
-    """Backtesting data source for Chinese A-shares via QMT Bridge.
+class QMTBridgeDataBacktesting(PandasDataBacktesting):
+    """Factory class that creates PandasDataBacktesting instances with QMT Bridge data.
 
-    Extends PandasData to auto-load historical data from a QMT Bridge server
-    at initialization time. This allows ``Strategy.backtest()`` to use
-    ``QMTBridgeDataBacktesting`` as the ``datasource_class`` directly.
+    This class overrides __new__ to return a PandasDataBacktesting instance
+    instead of itself. This allows Strategy.backtest() to use the optimized
+    pandas daily data processing path in strategy_executor.py.
+
+    The class appears as "QMTBridgeDataBacktesting" for import purposes but
+    the actual instance type is PandasDataBacktesting, which passes the
+    type().__name__ check in _is_pandas_daily_data_source().
 
     Parameters expected in ``config`` dict:
         host : str
@@ -60,14 +69,15 @@ class QMTBridgeDataBacktesting(PandasData):
     ... )
     """
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         datetime_start,
         datetime_end,
         config=None,
         pandas_data=None,
         **kwargs,
     ):
+        """Create and return a PandasDataBacktesting instance with QMT Bridge data."""
         config = config or {}
 
         if pandas_data is None:
@@ -90,9 +100,29 @@ class QMTBridgeDataBacktesting(PandasData):
                 dividend_type=dividend_type,
             )
 
-        super().__init__(
+        # Create a PandasDataBacktesting instance (not QMTBridgeDataBacktesting)
+        # so that strategy_executor.py's type().__name__ check passes.
+        instance = PandasDataBacktesting(
             datetime_start=datetime_start,
             datetime_end=datetime_end,
             pandas_data=pandas_data,
             **kwargs,
         )
+
+        # Initialize the data (sets _timestep from Data objects for daily data detection)
+        instance.load_data()
+
+        return instance
+
+    def __init__(
+        self,
+        datetime_start,
+        datetime_end,
+        config=None,
+        pandas_data=None,
+        **kwargs,
+    ):
+        """Initialize is handled by __new__ for this factory class."""
+        # __new__ creates and returns a PandasDataBacktesting instance,
+        # so this __init__ is never actually called on the returned object.
+        pass
