@@ -621,7 +621,7 @@ def get_qmt_symbols_historical_price(
     host: str,
     port: int,
     api_key: str,
-    dividend_type: str = "back",
+    dividend_type: str = "front",
     lookback_days: int = 60,
 ):
     """Fetch historical daily data from QMT Bridge for multiple symbols.

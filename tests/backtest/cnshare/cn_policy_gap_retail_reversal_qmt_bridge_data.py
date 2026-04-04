@@ -495,7 +495,7 @@ if __name__ == "__main__":
                 "port": qmt_port,
                 "api_key": qmt_api_key,
                 "symbols": symbols_to_trade,
-                "dividend_type": "back"  # Use forward adjustment (QFQ/前复权) to match original data source
+                "dividend_type": "front"  # Use forward adjustment (QFQ/前复权) to match original data source
             },
             parameters=strategy_params,
         )

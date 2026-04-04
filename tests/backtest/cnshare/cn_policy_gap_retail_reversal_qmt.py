@@ -475,7 +475,7 @@ if __name__ == "__main__":
         host=qmt_host,
         port=qmt_port,
         api_key=qmt_api_key,
-        dividend_type='back'  # Use forward adjustment (QFQ/前复权) to match original data source
+        dividend_type='front'  # Use forward adjustment (QFQ/前复权) to match original data source
     )
 
     if not pandas_data:
