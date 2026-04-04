@@ -5,15 +5,15 @@ Unit tests for Portfolio Strategy system.
 import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
+from collections import defaultdict
 
 from lumibot.strategies.portfolio_strategy import (
     PortfolioStrategy,
-    SubStrategy,
+    StrategyWrapper,
     OrderNettingEngine,
     PortfolioPositionManager,
     TradingSignal,
     NettedOrder,
-    SignalType,
 )
 
 
@@ -214,8 +214,8 @@ class TestPortfolioPositionManager:
         manager.update_position("strategy_a", "000001.SZ", 100, 10.0)
         manager.update_position("strategy_b", "000001.SZ", 50, 10.0)
 
-        pos_a = manager.get_sub_strategy_position("strategy_a", "000001.SZ")
-        pos_b = manager.get_sub_strategy_position("strategy_b", "000001.SZ")
+        pos_a = manager.get_strategy_position("strategy_a", "000001.SZ")
+        pos_b = manager.get_strategy_position("strategy_b", "000001.SZ")
         total = manager.get_portfolio_position("000001.SZ")
 
         assert pos_a == 100
@@ -234,152 +234,6 @@ class TestPortfolioPositionManager:
         assert len(all_pos) == 2
         assert "000001.SZ" in all_pos
         assert "600519.SH" in all_pos
-
-
-class TestSubStrategy:
-    """Tests for the SubStrategy class."""
-
-    def test_signal_generation(self):
-        """Test generating signals from sub-strategy."""
-        mock_portfolio = MagicMock()
-
-        class ConcreteSubStrategy(SubStrategy):
-            def on_trading_iteration(self):
-                pass
-
-        sub = ConcreteSubStrategy(mock_portfolio, "test_strategy")
-
-        sub.signal("000001.SZ", 100, price=10.0)
-
-        signals = sub.get_signals()
-        assert len(signals) == 1
-        assert signals[0].symbol == "000001.SZ"
-        assert signals[0].quantity == 100
-        assert signals[0].price == 10.0
-
-    def test_buy_sell_helpers(self):
-        """Test buy and sell helper methods."""
-        mock_portfolio = MagicMock()
-
-        class ConcreteSubStrategy(SubStrategy):
-            def on_trading_iteration(self):
-                pass
-
-        sub = ConcreteSubStrategy(mock_portfolio, "test_strategy")
-
-        sub.buy("000001.SZ", 100)
-        sub.sell("600519.SH", 50)
-
-        signals = sub.get_signals()
-        assert len(signals) == 2
-        assert signals[0].quantity == 100
-        assert signals[1].quantity == -50
-
-    def test_clear_signals(self):
-        """Test clearing signals."""
-        mock_portfolio = MagicMock()
-
-        class ConcreteSubStrategy(SubStrategy):
-            def on_trading_iteration(self):
-                pass
-
-        sub = ConcreteSubStrategy(mock_portfolio, "test_strategy")
-
-        sub.signal("000001.SZ", 100)
-        sub.clear_signals()
-
-        assert len(sub.get_signals()) == 0
-
-
-class TestPortfolioStrategy:
-    """Tests for the PortfolioStrategy class."""
-
-    def test_add_sub_strategy(self):
-        """Test adding sub-strategies."""
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        class TestSub(SubStrategy):
-            def on_trading_iteration(self):
-                pass
-
-        sub = portfolio.add_sub_strategy(TestSub, "test_sub")
-
-        assert "test_sub" in portfolio.get_all_sub_strategies()
-        assert portfolio.get_sub_strategy("test_sub") == sub
-
-    def test_remove_sub_strategy(self):
-        """Test removing sub-strategies."""
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        class TestSub(SubStrategy):
-            def on_trading_iteration(self):
-                pass
-
-        portfolio.add_sub_strategy(TestSub, "test_sub")
-        removed = portfolio.remove_sub_strategy("test_sub")
-
-        assert removed is not None
-        assert "test_sub" not in portfolio.get_all_sub_strategies()
-
-    def test_duplicate_strategy_id(self):
-        """Test that duplicate IDs raise an error."""
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        class TestSub(SubStrategy):
-            def on_trading_iteration(self):
-                pass
-
-        portfolio.add_sub_strategy(TestSub, "test_sub")
-
-        with pytest.raises(ValueError):
-            portfolio.add_sub_strategy(TestSub, "test_sub")
-
-    def test_run_iteration_collects_signals(self):
-        """Test that run_iteration collects signals from all sub-strategies."""
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        class BuyStrategy(SubStrategy):
-            def on_trading_iteration(self):
-                self.buy("000001.SZ", 100)
-
-        class SellStrategy(SubStrategy):
-            def on_trading_iteration(self):
-                self.sell("000001.SZ", 50)
-
-        portfolio.add_sub_strategy(BuyStrategy, "buyer")
-        portfolio.add_sub_strategy(SellStrategy, "seller")
-
-        signals = portfolio.run_iteration()
-
-        assert len(signals) == 2
-        assert any(s.quantity == 100 for s in signals)
-        assert any(s.quantity == -50 for s in signals)
-
-    def test_netted_orders_from_signals(self):
-        """Test getting netted orders from collected signals."""
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        class BuyStrategy(SubStrategy):
-            def on_trading_iteration(self):
-                self.buy("000001.SZ", 100)
-
-        class SellStrategy(SubStrategy):
-            def on_trading_iteration(self):
-                self.sell("000001.SZ", 100)
-
-        portfolio.add_sub_strategy(BuyStrategy, "buyer")
-        portfolio.add_sub_strategy(SellStrategy, "seller")
-
-        portfolio.run_iteration()
-        orders = portfolio.get_netted_orders()
-
-        # Net should be 0, so no orders
-        assert len(orders) == 0
 
 
 class TestTradingSignal:
@@ -417,6 +271,17 @@ class TestNettedOrder:
         assert order_with_qty.should_execute
         assert not order_zero.should_execute
 
+    def test_is_buy_is_sell(self):
+        """Test is_buy and is_sell properties."""
+        buy_order = NettedOrder(symbol="TEST", net_quantity=100)
+        sell_order = NettedOrder(symbol="TEST", net_quantity=-100)
+
+        assert buy_order.is_buy
+        assert not buy_order.is_sell
+
+        assert sell_order.is_sell
+        assert not sell_order.is_buy
+
     def test_component_signals_tracking(self):
         """Test that component signals are tracked."""
         signals = [
@@ -427,6 +292,175 @@ class TestNettedOrder:
 
         assert len(order.component_signals) == 2
         assert order.net_quantity == 150
+
+
+class TestStrategyWrapper:
+    """Tests for the StrategyWrapper class."""
+
+    def test_signal_interception(self):
+        """Test that signals are intercepted from wrapped strategy."""
+        from lumibot.strategies import Strategy
+
+        # Create a simple test strategy
+        class TestStrategy(Strategy):
+            def initialize(self, param1=10):
+                self.param1 = param1
+
+            def on_trading_iteration(self):
+                from lumibot.entities import Asset, Order
+                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
+                order = self.create_order(asset, 100, "buy")
+                self.submit_order(order)
+
+        # Create mock main strategy
+        mock_main = MagicMock()
+        mock_main._broker = MagicMock()
+        mock_main._data_source = MagicMock()
+        mock_main.datetime = datetime.now()
+
+        # Create portfolio
+        portfolio = PortfolioStrategy(mock_main)
+
+        # Add strategy
+        wrapper = portfolio.add_strategy(TestStrategy, "test", param1=20)
+
+        # Run iteration
+        signals = portfolio.run_iteration()
+
+        # Check signals were intercepted
+        assert len(signals) == 1
+        assert signals[0].symbol == "000001.SZ"
+        assert signals[0].quantity == 100
+
+
+class TestPortfolioStrategy:
+    """Tests for the PortfolioStrategy class."""
+
+    def test_add_strategy(self):
+        """Test adding strategies."""
+        from lumibot.strategies import Strategy
+
+        class DummyStrategy(Strategy):
+            def initialize(self):
+                pass
+            def on_trading_iteration(self):
+                pass
+
+        mock_main = MagicMock()
+        portfolio = PortfolioStrategy(mock_main)
+
+        portfolio.add_strategy(DummyStrategy, "test_strategy")
+
+        assert "test_strategy" in portfolio.get_all_strategies()
+
+    def test_remove_strategy(self):
+        """Test removing strategies."""
+        from lumibot.strategies import Strategy
+
+        class DummyStrategy(Strategy):
+            def initialize(self):
+                pass
+            def on_trading_iteration(self):
+                pass
+
+        mock_main = MagicMock()
+        portfolio = PortfolioStrategy(mock_main)
+
+        portfolio.add_strategy(DummyStrategy, "test_strategy")
+        removed = portfolio.remove_strategy("test_strategy")
+
+        assert removed is not None
+        assert "test_strategy" not in portfolio.get_all_strategies()
+
+    def test_duplicate_strategy_id(self):
+        """Test that duplicate IDs raise an error."""
+        from lumibot.strategies import Strategy
+
+        class DummyStrategy(Strategy):
+            def initialize(self):
+                pass
+            def on_trading_iteration(self):
+                pass
+
+        mock_main = MagicMock()
+        portfolio = PortfolioStrategy(mock_main)
+
+        portfolio.add_strategy(DummyStrategy, "test_strategy")
+
+        with pytest.raises(ValueError):
+            portfolio.add_strategy(DummyStrategy, "test_strategy")
+
+    def test_run_iteration_collects_signals(self):
+        """Test that run_iteration collects signals from all strategies."""
+        from lumibot.strategies import Strategy
+        from lumibot.entities import Asset
+
+        class BuyStrategy(Strategy):
+            def initialize(self):
+                pass
+            def on_trading_iteration(self):
+                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
+                order = self.create_order(asset, 100, "buy")
+                self.submit_order(order)
+
+        class SellStrategy(Strategy):
+            def initialize(self):
+                pass
+            def on_trading_iteration(self):
+                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
+                order = self.create_order(asset, 50, "sell")
+                self.submit_order(order)
+
+        mock_main = MagicMock()
+        mock_main._broker = MagicMock()
+        mock_main._data_source = MagicMock()
+        mock_main.datetime = datetime.now()
+
+        portfolio = PortfolioStrategy(mock_main)
+        portfolio.add_strategy(BuyStrategy, "buyer")
+        portfolio.add_strategy(SellStrategy, "seller")
+
+        signals = portfolio.run_iteration()
+
+        assert len(signals) == 2
+        assert any(s.quantity == 100 for s in signals)
+        assert any(s.quantity == -50 for s in signals)
+
+    def test_netted_orders_from_signals(self):
+        """Test getting netted orders from collected signals."""
+        from lumibot.strategies import Strategy
+        from lumibot.entities import Asset
+
+        class BuyStrategy(Strategy):
+            def initialize(self):
+                pass
+            def on_trading_iteration(self):
+                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
+                order = self.create_order(asset, 100, "buy")
+                self.submit_order(order)
+
+        class SellStrategy(Strategy):
+            def initialize(self):
+                pass
+            def on_trading_iteration(self):
+                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
+                order = self.create_order(asset, 100, "sell")
+                self.submit_order(order)
+
+        mock_main = MagicMock()
+        mock_main._broker = MagicMock()
+        mock_main._data_source = MagicMock()
+        mock_main.datetime = datetime.now()
+
+        portfolio = PortfolioStrategy(mock_main)
+        portfolio.add_strategy(BuyStrategy, "buyer")
+        portfolio.add_strategy(SellStrategy, "seller")
+
+        portfolio.run_iteration()
+        orders = portfolio.get_netted_orders()
+
+        # Net should be 0, so no orders
+        assert len(orders) == 0
 
 
 if __name__ == "__main__":

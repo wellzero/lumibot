@@ -444,7 +444,6 @@ if __name__ == "__main__":
         "daily_loss_limit": 0.03,
         "rebalance_freq": "daily",
     }
-    IS_BACKTESTING = True
 
     # ── Backtest mode ───────────────────────────────────────────────────────
     if IS_BACKTESTING:

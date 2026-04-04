@@ -6,49 +6,34 @@ PortfolioStrategy, providing order netting, position aggregation, and multi-stra
 coordination.
 
 Key Features:
-- Multiple sub-strategies under one portfolio
+- Wrap existing strategies without modification
+- Intercept order creation and convert to signals
 - Order netting (combines buy/sell for same symbol)
 - Position aggregation at portfolio level
-- Cross-strategy event communication
-- Unified execution through single broker connection
+- Cross-strategy coordination
 
 Example:
-    >>> class SubStrategyA(SubStrategy):
-    ...     def on_trading_iteration(self):
-    ...         self.signal("000001.SZ", 100)  # Buy 100 shares
-    >>>
-    >>> class SubStrategyB(SubStrategy):
-    ...     def on_trading_iteration(self):
-    ...         self.signal("000001.SZ", -100)  # Sell 100 shares
+    >>> from my_strategies import StrategyA, StrategyB
     >>>
     >>> class MyPortfolio(PortfolioStrategy):
     ...     def initialize(self):
-    ...         self.add_sub_strategy(SubStrategyA, "strategy_a")
-    ...         self.add_sub_strategy(SubStrategyB, "strategy_b")
-    >>>     # Orders are netted: 100 + (-100) = 0 → No trade executed
+    ...         self.add_strategy(StrategyA, "strategy_a", **params_a)
+    ...         self.add_strategy(StrategyB, "strategy_b", **params_b)
+    >>>
+    >>> # Orders are netted: StrategyA buys 100 + StrategyB sells 100 = 0 trades
 """
 
 import logging
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Type, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from lumibot.entities import Asset, Order, Position
     from lumibot.strategies.strategy import Strategy
 
 logger = logging.getLogger(__name__)
-
-
-class SignalType(Enum):
-    """Signal type for sub-strategy orders."""
-    BUY = 1
-    SELL = -1
-    HOLD = 0
 
 
 @dataclass
@@ -60,6 +45,7 @@ class TradingSignal:
     price: Optional[float] = None  # Limit price, None for market
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    order_type: str = "market"  # "market" or "limit"
 
     @property
     def is_buy(self) -> bool:
@@ -102,7 +88,7 @@ class NettedOrder:
 
 class OrderNettingEngine:
     """
-    Engine for netting orders across multiple sub-strategies.
+    Engine for netting orders across multiple strategies.
 
     Aggregates trading signals and combines orders for the same symbol,
     reducing unnecessary trades when signals offset each other.
@@ -196,7 +182,7 @@ class OrderNettingEngine:
             summary[symbol] = {
                 "signal_count": len(signals),
                 "net_quantity": net_qty,
-                "strategies": [s.strategy_id for s in signals],
+                "strategies": list(set(s.strategy_id for s in signals)),
                 "signals": [
                     {"strategy": s.strategy_id, "qty": s.quantity, "price": s.price}
                     for s in signals
@@ -207,29 +193,29 @@ class OrderNettingEngine:
 
 class PortfolioPositionManager:
     """
-    Manages positions at the portfolio level across all sub-strategies.
+    Manages positions at the portfolio level across all strategies.
     """
 
     def __init__(self):
         self._positions: Dict[str, Dict[str, Any]] = defaultdict(
-            lambda: {"quantity": 0.0, "avg_cost": 0.0, "sub_strategy_positions": {}}
+            lambda: {"quantity": 0.0, "avg_cost": 0.0, "strategy_positions": {}}
         )
-        self._sub_strategy_positions: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self._strategy_positions: Dict[str, Dict[str, float]] = defaultdict(dict)
 
     def update_position(self, strategy_id: str, symbol: str, quantity: float, price: float) -> None:
         """
         Update position after a trade execution.
 
         Args:
-            strategy_id: ID of the sub-strategy
+            strategy_id: ID of the strategy
             symbol: Trading symbol
             quantity: Quantity traded (positive for buy, negative for sell)
             price: Execution price
         """
-        # Update sub-strategy position
-        old_qty = self._sub_strategy_positions[strategy_id].get(symbol, 0.0)
+        # Update strategy-level position
+        old_qty = self._strategy_positions[strategy_id].get(symbol, 0.0)
         new_qty = old_qty + quantity
-        self._sub_strategy_positions[strategy_id][symbol] = new_qty
+        self._strategy_positions[strategy_id][symbol] = new_qty
 
         # Update portfolio-level position
         old_portfolio_qty = self._positions[symbol]["quantity"]
@@ -254,173 +240,161 @@ class PortfolioPositionManager:
             symbol: Trading symbol
 
         Returns:
-            Position dictionary with quantity, avg_cost, and sub-strategy breakdown
+            Position dictionary with quantity, avg_cost, and strategy breakdown
         """
         return dict(self._positions[symbol])
 
-    def get_sub_strategy_position(self, strategy_id: str, symbol: str) -> float:
+    def get_strategy_position(self, strategy_id: str, symbol: str) -> float:
         """
-        Get a sub-strategy's position in a symbol.
+        Get a strategy's position in a symbol.
 
         Args:
-            strategy_id: ID of the sub-strategy
+            strategy_id: ID of the strategy
             symbol: Trading symbol
 
         Returns:
             Position quantity
         """
-        return self._sub_strategy_positions[strategy_id].get(symbol, 0.0)
+        return self._strategy_positions[strategy_id].get(symbol, 0.0)
 
     def get_all_positions(self) -> Dict[str, Dict[str, Any]]:
         """Get all portfolio positions."""
         return {k: dict(v) for k, v in self._positions.items() if v["quantity"] != 0}
 
-    def get_sub_strategy_positions(self, strategy_id: str) -> Dict[str, float]:
-        """Get all positions for a specific sub-strategy."""
-        return dict(self._sub_strategy_positions[strategy_id])
+    def get_strategy_positions(self, strategy_id: str) -> Dict[str, float]:
+        """Get all positions for a specific strategy."""
+        return dict(self._strategy_positions[strategy_id])
 
 
-class SubStrategy(ABC):
+class StrategyWrapper:
     """
-    Base class for sub-strategies within a portfolio.
+    Wraps an existing Strategy class to intercept orders and convert to signals.
 
-    Sub-strategies generate signals that are aggregated by the portfolio
-    and netted before execution.
+    This allows using existing strategies without modification while
+    enabling order netting at the portfolio level.
     """
 
-    def __init__(self, portfolio: 'PortfolioStrategy', strategy_id: str):
+    def __init__(self,
+                 strategy_class: Type['Strategy'],
+                 strategy_id: str,
+                 portfolio: 'PortfolioStrategy',
+                 **strategy_params):
         """
-        Initialize the sub-strategy.
+        Initialize the strategy wrapper.
 
         Args:
+            strategy_class: The Strategy class to wrap
+            strategy_id: Unique identifier for this strategy
             portfolio: The parent portfolio strategy
-            strategy_id: Unique identifier for this sub-strategy
+            **strategy_params: Parameters to pass to the strategy's initialize
         """
-        self.portfolio = portfolio
+        self.strategy_class = strategy_class
         self.strategy_id = strategy_id
+        self.portfolio = portfolio
+        self.strategy_params = strategy_params
         self._signals: List[TradingSignal] = []
+        self._instance: Optional['Strategy'] = None
+        self._original_submit_order = None
+        self._original_create_order = None
 
-    def initialize(self, **kwargs) -> None:
+    def create_instance(self, main_strategy: 'Strategy') -> 'Strategy':
         """
-        Initialize the sub-strategy. Override this method to set up parameters.
-
-        This method is called once when the sub-strategy is added to the portfolio.
-        """
-        pass
-
-    @abstractmethod
-    def on_trading_iteration(self) -> None:
-        """
-        Main trading logic. Override this method to implement your strategy.
-
-        Use signal() or signal_asset() to generate trading signals.
-        """
-        pass
-
-    def signal(self, symbol: str, quantity: float, price: Optional[float] = None,
-               **metadata) -> None:
-        """
-        Generate a trading signal.
+        Create a strategy instance with order interception.
 
         Args:
-            symbol: Trading symbol
-            quantity: Quantity (positive for buy, negative for sell)
-            price: Limit price (None for market order)
-            **metadata: Additional metadata for the signal
+            main_strategy: The main portfolio strategy
+
+        Returns:
+            The wrapped strategy instance
         """
-        signal = TradingSignal(
-            strategy_id=self.strategy_id,
-            symbol=symbol,
-            quantity=quantity,
-            price=price,
-            metadata=metadata
-        )
-        self._signals.append(signal)
+        # Create instance
+        self._instance = self.strategy_class.__new__(self.strategy_class)
 
-    def signal_asset(self, asset: 'Asset', quantity: float,
-                     price: Optional[float] = None, **metadata) -> None:
-        """
-        Generate a trading signal for an Asset object.
+        # Store original methods
+        self._original_submit_order = self._instance.submit_order
+        self._original_create_order = self._instance.create_order
 
-        Args:
-            asset: The asset to trade
-            quantity: Quantity (positive for buy, negative for sell)
-            price: Limit price (None for market order)
-            **metadata: Additional metadata for the signal
-        """
-        self.signal(symbol=asset.symbol, quantity=quantity, price=price, **metadata)
+        # Monkey-patch order methods to intercept orders
+        def patched_submit_order(order):
+            """Convert order to signal instead of submitting."""
+            symbol = order.asset.symbol if hasattr(order, 'asset') else order.symbol
+            quantity = order.quantity if order.side == "buy" else -order.quantity
+            price = getattr(order, 'limit_price', None)
 
-    def buy(self, symbol: str, quantity: float, price: Optional[float] = None,
-            **metadata) -> None:
-        """Generate a buy signal."""
-        self.signal(symbol, abs(quantity), price, **metadata)
+            signal = TradingSignal(
+                strategy_id=self.strategy_id,
+                symbol=symbol,
+                quantity=quantity,
+                price=price,
+                order_type="limit" if price else "market"
+            )
+            self._signals.append(signal)
+            logger.debug(f"[{self.strategy_id}] Intercepted order: {symbol} qty={quantity}")
+            return order  # Return order but don't submit
 
-    def sell(self, symbol: str, quantity: float, price: Optional[float] = None,
-             **metadata) -> None:
-        """Generate a sell signal."""
-        self.signal(symbol, -abs(quantity), price, **metadata)
+        def patched_create_order(asset, quantity, side, limit_price=None, **kwargs):
+            """Create order but don't submit - will be netted."""
+            from lumibot.entities import Order
+            order = Order(
+                strategy=self._instance,
+                asset=asset,
+                quantity=quantity,
+                side=side,
+                limit_price=limit_price,
+                **kwargs
+            )
+            return order
+
+        # Apply patches
+        self._instance.submit_order = patched_submit_order
+        self._instance.create_order = patched_create_order
+
+        # Share data from main strategy
+        self._instance._broker = main_strategy._broker
+        self._instance._data_source = main_strategy._data_source
+        self._instance.datetime = main_strategy.datetime
+
+        # Initialize with params
+        if hasattr(self._instance, 'initialize'):
+            self._instance.initialize(**self.strategy_params)
+
+        return self._instance
 
     def get_signals(self) -> List[TradingSignal]:
-        """Get all signals generated in this iteration."""
+        """Get all signals generated by this strategy."""
         return self._signals
 
     def clear_signals(self) -> None:
         """Clear all signals."""
         self._signals.clear()
 
-    def get_position(self, symbol: str) -> float:
-        """
-        Get this sub-strategy's position in a symbol.
-
-        Args:
-            symbol: Trading symbol
-
-        Returns:
-            Position quantity
-        """
-        return self.portfolio.position_manager.get_sub_strategy_position(
-            self.strategy_id, symbol
-        )
-
-    def get_portfolio_position(self, symbol: str) -> float:
-        """
-        Get the portfolio-level position for a symbol.
-
-        Args:
-            symbol: Trading symbol
-
-        Returns:
-            Total position quantity across all sub-strategies
-        """
-        pos = self.portfolio.position_manager.get_portfolio_position(symbol)
-        return pos.get("quantity", 0.0)
-
-    # Delegate data access to portfolio
-    def get_last_price(self, symbol: str) -> Optional[float]:
-        """Get last price for a symbol."""
-        return self.portfolio.get_last_price(symbol)
-
-    def get_historical_prices(self, symbol: str, **kwargs):
-        """Get historical prices for a symbol."""
-        return self.portfolio.get_historical_prices(symbol, **kwargs)
+    def run_iteration(self) -> None:
+        """Run one trading iteration of the wrapped strategy."""
+        if self._instance and hasattr(self._instance, 'on_trading_iteration'):
+            try:
+                # Update datetime from main strategy
+                self._instance.datetime = self.portfolio.main_strategy.datetime
+                self._instance.on_trading_iteration()
+            except Exception as e:
+                logger.error(f"[{self.strategy_id}] Error in on_trading_iteration: {e}")
 
 
 class PortfolioStrategy:
     """
-    Portfolio Strategy that manages multiple sub-strategies with order netting.
+    Portfolio Strategy that manages multiple strategies with order netting.
 
-    This class coordinates multiple sub-strategies, aggregates their signals,
-    and executes netted orders through the main strategy.
+    This class coordinates multiple strategies, intercepts their orders,
+    aggregates them as signals, and executes netted orders.
 
     Example:
         >>> portfolio = PortfolioStrategy(main_strategy=my_strategy)
-        >>> portfolio.add_sub_strategy(MySubStrategyA, "strategy_a", param1=10)
-        >>> portfolio.add_sub_strategy(MySubStrategyB, "strategy_b", param2=20)
+        >>> portfolio.add_strategy(StrategyA, "strategy_a", param1=10)
+        >>> portfolio.add_strategy(StrategyB, "strategy_b", param2=20)
         >>>
         >>> # In main strategy's on_trading_iteration:
-        >>> portfolio.run_iteration()
-        >>> orders = portfolio.get_netted_orders()
-        >>> portfolio.execute_orders(orders)
+        >>> portfolio.run_iteration()  # Runs all strategies, collects signals
+        >>> orders = portfolio.get_netted_orders()  # Returns netted orders
+        >>> portfolio.execute_orders(orders)  # Executes through main strategy
     """
 
     def __init__(self, main_strategy: 'Strategy', min_net_quantity: float = 1.0):
@@ -434,60 +408,69 @@ class PortfolioStrategy:
         self.main_strategy = main_strategy
         self.netting_engine = OrderNettingEngine(min_net_quantity)
         self.position_manager = PortfolioPositionManager()
-        self._sub_strategies: Dict[str, SubStrategy] = {}
+        self._strategies: Dict[str, StrategyWrapper] = {}
         self._iteration_count = 0
 
-    def add_sub_strategy(self, strategy_class: type, strategy_id: str,
-                         **kwargs) -> SubStrategy:
+    def add_strategy(self,
+                     strategy_class: Type['Strategy'],
+                     strategy_id: str,
+                     **kwargs) -> StrategyWrapper:
         """
-        Add a sub-strategy to the portfolio.
+        Add a strategy to the portfolio.
 
         Args:
-            strategy_class: Sub-strategy class (must inherit from SubStrategy)
-            strategy_id: Unique identifier for this sub-strategy
-            **kwargs: Parameters to pass to the sub-strategy's initialize method
+            strategy_class: Strategy class (must inherit from Strategy)
+            strategy_id: Unique identifier for this strategy
+            **kwargs: Parameters to pass to the strategy's initialize method
 
         Returns:
-            The created sub-strategy instance
+            The created strategy wrapper
         """
-        if strategy_id in self._sub_strategies:
-            raise ValueError(f"Sub-strategy with ID '{strategy_id}' already exists")
+        if strategy_id in self._strategies:
+            raise ValueError(f"Strategy with ID '{strategy_id}' already exists")
 
-        sub_strategy = strategy_class(self, strategy_id)
-        sub_strategy.initialize(**kwargs)
-        self._sub_strategies[strategy_id] = sub_strategy
+        wrapper = StrategyWrapper(
+            strategy_class=strategy_class,
+            strategy_id=strategy_id,
+            portfolio=self,
+            **kwargs
+        )
 
-        logger.info(f"[PortfolioStrategy] Added sub-strategy: {strategy_id}")
-        return sub_strategy
+        # Create instance with order interception
+        wrapper.create_instance(self.main_strategy)
 
-    def remove_sub_strategy(self, strategy_id: str) -> Optional[SubStrategy]:
+        self._strategies[strategy_id] = wrapper
+        logger.info(f"[PortfolioStrategy] Added strategy: {strategy_id}")
+        return wrapper
+
+    def remove_strategy(self, strategy_id: str) -> Optional[StrategyWrapper]:
         """
-        Remove a sub-strategy from the portfolio.
+        Remove a strategy from the portfolio.
 
         Args:
-            strategy_id: ID of the sub-strategy to remove
+            strategy_id: ID of the strategy to remove
 
         Returns:
-            The removed sub-strategy, or None if not found
+            The removed strategy wrapper, or None if not found
         """
-        return self._sub_strategies.pop(strategy_id, None)
+        return self._strategies.pop(strategy_id, None)
 
-    def get_sub_strategy(self, strategy_id: str) -> Optional[SubStrategy]:
-        """Get a sub-strategy by ID."""
-        return self._sub_strategies.get(strategy_id)
+    def get_strategy(self, strategy_id: str) -> Optional[StrategyWrapper]:
+        """Get a strategy wrapper by ID."""
+        return self._strategies.get(strategy_id)
 
-    def get_all_sub_strategies(self) -> Dict[str, SubStrategy]:
-        """Get all sub-strategies."""
-        return dict(self._sub_strategies)
+    def get_all_strategies(self) -> Dict[str, StrategyWrapper]:
+        """Get all strategy wrappers."""
+        return dict(self._strategies)
 
     def run_iteration(self) -> List[TradingSignal]:
         """
-        Run one trading iteration across all sub-strategies.
+        Run one trading iteration across all strategies.
 
         This method:
         1. Clears previous signals
-        2. Calls on_trading_iteration() for each sub-strategy
-        3. Collects all signals
+        2. Calls on_trading_iteration() for each strategy
+        3. Collects all intercepted signals
         4. Adds them to the netting engine
 
         Returns:
@@ -498,17 +481,17 @@ class PortfolioStrategy:
 
         # Clear previous state
         self.netting_engine.clear_signals()
-        for sub in self._sub_strategies.values():
-            sub.clear_signals()
+        for wrapper in self._strategies.values():
+            wrapper.clear_signals()
 
-        # Run each sub-strategy
-        for strategy_id, sub in self._sub_strategies.items():
+        # Run each strategy
+        for strategy_id, wrapper in self._strategies.items():
             try:
-                logger.debug(f"[PortfolioStrategy] Running sub-strategy: {strategy_id}")
-                sub.on_trading_iteration()
+                logger.debug(f"[PortfolioStrategy] Running strategy: {strategy_id}")
+                wrapper.run_iteration()
 
                 # Collect signals
-                signals = sub.get_signals()
+                signals = wrapper.get_signals()
                 all_signals.extend(signals)
                 self.netting_engine.add_signals(signals)
 
@@ -516,7 +499,7 @@ class PortfolioStrategy:
                 logger.error(f"[PortfolioStrategy] Error in {strategy_id}: {e}")
 
         logger.info(f"[PortfolioStrategy] Iteration {self._iteration_count}: "
-                   f"{len(all_signals)} signals from {len(self._sub_strategies)} strategies")
+                   f"{len(all_signals)} signals from {len(self._strategies)} strategies")
         return all_signals
 
     def get_netted_orders(self) -> List[NettedOrder]:
@@ -549,29 +532,27 @@ class PortfolioStrategy:
 
             try:
                 # Create order through main strategy
-                from lumibot.entities import Asset
+                from lumibot.entities import Asset, Order
 
                 asset = Asset(symbol=netted.symbol, asset_type=Asset.AssetType.STOCK)
 
-                if netted.is_buy:
-                    order = self.main_strategy.create_order(
-                        asset=asset,
-                        quantity=int(netted.abs_quantity),
-                        side="buy",
-                        limit_price=netted.price
-                    )
-                else:
-                    order = self.main_strategy.create_order(
-                        asset=asset,
-                        quantity=int(netted.abs_quantity),
-                        side="sell",
-                        limit_price=netted.price
-                    )
+                # Use original (unpatched) methods
+                side = "buy" if netted.is_buy else "sell"
+                quantity = int(netted.abs_quantity)
 
-                if order:
-                    executed_orders.append(order)
-                    logger.info(f"[PortfolioStrategy] Executed: {netted.symbol} "
-                               f"qty={netted.net_quantity}")
+                order = self.main_strategy.create_order(
+                    asset=asset,
+                    quantity=quantity,
+                    side=side,
+                    limit_price=netted.price
+                )
+
+                # Submit through main strategy
+                self.main_strategy.submit_order(order)
+                executed_orders.append(order)
+
+                logger.info(f"[PortfolioStrategy] Executed: {netted.symbol} "
+                           f"qty={netted.net_quantity}")
 
             except Exception as e:
                 logger.error(f"[PortfolioStrategy] Failed to execute order for "
@@ -618,32 +599,18 @@ class PortfolioStrategy:
         """
         return {
             "iteration": self._iteration_count,
-            "sub_strategies": list(self._sub_strategies.keys()),
+            "strategies": list(self._strategies.keys()),
             "netting_details": self.netting_engine.get_netting_summary(),
             "positions": self.position_manager.get_all_positions()
         }
-
-    # Delegate data access to main strategy
-    def get_last_price(self, symbol: str) -> Optional[float]:
-        """Get last price for a symbol."""
-        from lumibot.entities import Asset
-        asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
-        return self.main_strategy.get_last_price(asset)
-
-    def get_historical_prices(self, symbol: str, **kwargs):
-        """Get historical prices for a symbol."""
-        from lumibot.entities import Asset
-        asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
-        return self.main_strategy.get_historical_prices(asset, **kwargs)
 
 
 # Convenience exports
 __all__ = [
     'PortfolioStrategy',
-    'SubStrategy',
+    'StrategyWrapper',
     'OrderNettingEngine',
     'PortfolioPositionManager',
     'TradingSignal',
     'NettedOrder',
-    'SignalType',
 ]
