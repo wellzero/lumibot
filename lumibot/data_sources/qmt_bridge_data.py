@@ -152,8 +152,7 @@ class QMTBridgeData(DataSource):
             Additional keyword arguments.
         """
         # Set timezone to Asia/Shanghai for Chinese markets
-        if tzinfo is None:
-            tzinfo = pytz.timezone("Asia/Shanghai")
+        tzinfo = pytz.timezone("Asia/Shanghai")
 
         super().__init__(api_key=api_key, tzinfo=tzinfo, **kwargs)
 
@@ -687,11 +686,23 @@ def get_qmt_symbols_historical_price(
             total_batches = (total_symbols + batch_size - 1) // batch_size
             logger.info("  Downloading batch %d/%d (%d symbols)...", batch_num, total_batches, len(batch))
 
-            for symbol in batch:
-                try:
-                    client.download(symbol, "1d", start=start_date, end=end_date)
-                except Exception as e:
-                    logger.debug("    Download skipped for %s: %s", symbol, e)
+            # Convert symbols to QMT format: SZ000001 → 000001.SZ, SH600519 → 600519.SH
+            def to_qmt_format(sym: str) -> str:
+                if sym.startswith("SZ"):
+                    return f"{sym[2:]}.SZ"
+                elif sym.startswith("SH"):
+                    return f"{sym[2:]}.SH"
+                return sym  # Already in correct format (e.g., "000001.SZ")
+            batch_api = [to_qmt_format(s) for s in batch]
+            try:
+                client.download_batch(
+                    stocks=batch_api,
+                    period="1d",
+                    start_time=fetch_start,
+                    end_time=fetch_end
+                )
+            except Exception as e:
+                logger.debug("    Batch download skipped: %s", e)
 
         # Step 2: Load data from local storage
         logger.info("Loading historical data from local storage...")
