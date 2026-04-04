@@ -20,6 +20,7 @@ The key is to separate SIGNAL GENERATION from ORDER EXECUTION:
 
 import os
 import sys
+import argparse
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -35,7 +36,6 @@ from lumibot.strategies.portfolio_strategy import (
     TradingSignal,
     NettedOrder,
 )
-from lumibot.credentials import IS_BACKTESTING
 
 # ── Environment Setup ──────────────────────────────────────────────────────────
 
@@ -528,30 +528,76 @@ class CombinedPortfolioStrategy(Strategy):
         self.positions_dict.clear()
 
 
-# ── Backtest Entry Point ───────────────────────────────────────────────────────
+# ── Live Trading Mode ──────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    # Configuration
+def run_live_trading(symbols, strategy_params):
+    """Run live trading with QMT Bridge."""
+    from lumibot.data_sources import QMTBridgeData
+    from lumibot.brokers import QMTBridgeBroker
+    from lumibot.traders import Trader
+
     qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
     qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
     qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
-    symbols_to_trade = DEFAULT_SYMBOLS
+    qmt_account_id = os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
 
-    strategy_params = {
-        "symbols": symbols_to_trade,
-        "lot_size": 100,
-        "max_positions": 12,
-        "gap_min": 0.02,
-        "gap_max": 0.10,
-        "volume_multiple": 1.2,
-        "min_vol_ratio": 1.3,
-        "min_score_entry": 55,
-        "profit_target": 0.10,
-        "stop_loss": 0.05,
-        "max_hold_days": 15,
-    }
+    if not qmt_account_id:
+        print("ERROR: QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
+        print("Set it in your .env file or environment variables")
+        sys.exit(1)
 
-    # Backtest configuration
+    print("=" * 70)
+    print("Combined Portfolio Strategy - LIVE TRADING")
+    print("=" * 70)
+    print(f"QMT Bridge Host: {qmt_host}")
+    print(f"QMT Bridge Port: {qmt_port}")
+    print(f"Account ID: {qmt_account_id}")
+    print(f"Symbols: {len(symbols)}")
+    print("=" * 70)
+    print("Signal Generators:")
+    print("  1. GapFade (contrarian - buys on gap down)")
+    print("  2. Momentum (trend - buys on breakout)")
+    print("Order Netting: ENABLED")
+    print("=" * 70)
+    print("\nStarting live trading... (Ctrl+C to stop)\n")
+
+    # Create data source for live market data
+    data_source = QMTBridgeData(
+        host=qmt_host,
+        port=qmt_port,
+        api_key=qmt_api_key,
+    )
+
+    # Create broker for live order execution
+    broker = QMTBridgeBroker(
+        host=qmt_host,
+        port=qmt_port,
+        api_key=qmt_api_key,
+        account_id=qmt_account_id,
+        data_source=data_source,
+        connect_stream=True,
+    )
+
+    # Create strategy instance
+    strategy = CombinedPortfolioStrategy(
+        broker=broker,
+        parameters=strategy_params,
+    )
+
+    # Run live trading
+    trader = Trader(backtest=False)
+    trader.add_strategy(strategy)
+    trader.run_all()
+
+
+# ── Backtest Mode ──────────────────────────────────────────────────────────────
+
+def run_backtest(symbols, strategy_params):
+    """Run backtest with QMT Bridge data."""
+    qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
+    qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
+    qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
+
     backtesting_start_date = '2022-01-01'
     backtesting_end_date = '2024-12-31'
 
@@ -564,13 +610,13 @@ if __name__ == "__main__":
     base_filename = f"{execution_folder_path}/combined_portfolio_{timestamp}"
 
     print("=" * 70)
-    print("Combined Portfolio Strategy Backtest")
+    print("Combined Portfolio Strategy - BACKTEST")
     print("=" * 70)
     print(f"Signal Generators:")
     print(f"  - GapFade (contrarian - buys on gap down)")
     print(f"  - Momentum (trend - buys on breakout)")
     print(f"Order Netting: ENABLED")
-    print(f"Symbols: {len(symbols_to_trade)}")
+    print(f"Symbols: {len(symbols)}")
     print(f"Backtest: {backtesting_start_date} to {backtesting_end_date}")
     print("=" * 70)
 
@@ -587,7 +633,7 @@ if __name__ == "__main__":
             "host": qmt_host,
             "port": qmt_port,
             "api_key": qmt_api_key,
-            "symbols": symbols_to_trade,
+            "symbols": symbols,
             "dividend_type": "front"
         },
         parameters=strategy_params,
@@ -605,3 +651,83 @@ if __name__ == "__main__":
         print(f"Sharpe Ratio: {results.get('sharpe', 'N/A')}")
         print(f"Total Trades: {results.get('total_trades', 'N/A')}")
         print("=" * 70)
+
+    return results
+
+
+# ── Entry Point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Combined Portfolio Strategy with Order Netting",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run backtest (default)
+  python combined_portfolio_strategy.py
+
+  # Run live trading
+  python combined_portfolio_strategy.py --live
+
+  # Run live trading with custom symbols
+  python combined_portfolio_strategy.py --live --symbols 000001.SZ,600519.SH,300750.SZ
+
+  # Run backtest with custom parameters
+  python combined_portfolio_strategy.py --gap-min 0.03 --profit-target 0.08
+        """
+    )
+
+    # Mode selection
+    parser.add_argument(
+        "--live", action="store_true",
+        help="Run live trading (default: backtest)"
+    )
+
+    # Symbol selection
+    parser.add_argument(
+        "--symbols", type=str, default=None,
+        help="Comma-separated list of symbols (default: use DEFAULT_SYMBOLS)"
+    )
+
+    # Strategy parameters
+    parser.add_argument("--lot-size", type=int, default=100, help="Lot size (default: 100)")
+    parser.add_argument("--max-positions", type=int, default=12, help="Max positions (default: 12)")
+    parser.add_argument("--profit-target", type=float, default=0.10, help="Profit target (default: 0.10)")
+    parser.add_argument("--stop-loss", type=float, default=0.05, help="Stop loss (default: 0.05)")
+    parser.add_argument("--max-hold-days", type=int, default=15, help="Max hold days (default: 15)")
+    parser.add_argument("--gap-min", type=float, default=0.02, help="Min gap (default: 0.02)")
+    parser.add_argument("--gap-max", type=float, default=0.10, help="Max gap (default: 0.10)")
+    parser.add_argument("--volume-multiple", type=float, default=1.2, help="Volume multiple (default: 1.2)")
+    parser.add_argument("--min-vol-ratio", type=float, default=1.3, help="Min volume ratio (default: 1.3)")
+    parser.add_argument("--min-score", type=int, default=55, help="Min momentum score (default: 55)")
+
+    args = parser.parse_args()
+
+    # Parse symbols
+    if args.symbols:
+        symbols_to_trade = [s.strip() for s in args.symbols.split(",")]
+    else:
+        symbols_to_trade = DEFAULT_SYMBOLS
+
+    # Build strategy parameters
+    strategy_params = {
+        "symbols": symbols_to_trade,
+        "lot_size": args.lot_size,
+        "max_positions": args.max_positions,
+        "profit_target": args.profit_target,
+        "stop_loss": args.stop_loss,
+        "max_hold_days": args.max_hold_days,
+        "gap_min": args.gap_min,
+        "gap_max": args.gap_max,
+        "volume_multiple": args.volume_multiple,
+        "min_vol_ratio": args.min_vol_ratio,
+        "min_score_entry": args.min_score,
+    }
+
+    # Run in appropriate mode
+    if args.live:
+        run_live_trading(symbols_to_trade, strategy_params)
+    else:
+        run_backtest(symbols_to_trade, strategy_params)
