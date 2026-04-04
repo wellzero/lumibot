@@ -1,5 +1,5 @@
 """
-Unit tests for Portfolio Strategy system.
+Unit tests for Portfolio Strategy system - Order Interception Approach.
 """
 
 import pytest
@@ -8,459 +8,288 @@ from unittest.mock import MagicMock, patch
 from collections import defaultdict
 
 from lumibot.strategies.portfolio_strategy import (
-    PortfolioStrategy,
-    StrategyWrapper,
-    OrderNettingEngine,
-    PortfolioPositionManager,
-    TradingSignal,
+    OrderInterceptor,
+    AccumulatedOrder,
     NettedOrder,
+    run_strategy_with_interception,
 )
 
 
-class TestOrderNettingEngine:
-    """Tests for the OrderNettingEngine class."""
+class TestAccumulatedOrder:
+    """Tests for the AccumulatedOrder dataclass."""
 
-    def test_add_single_buy_signal(self):
-        """Test adding a single buy signal."""
-        engine = OrderNettingEngine()
-        signal = TradingSignal(
+    def test_create_buy_order(self):
+        """Test creating a buy order."""
+        order = AccumulatedOrder(
             strategy_id="strategy_a",
             symbol="000001.SZ",
+            side="buy",
             quantity=100
         )
-        engine.add_signal(signal)
-        orders = engine.get_netted_orders()
+        assert order.strategy_id == "strategy_a"
+        assert order.symbol == "000001.SZ"
+        assert order.side == "buy"
+        assert order.quantity == 100
 
-        assert len(orders) == 1
-        assert orders[0].symbol == "000001.SZ"
-        assert orders[0].net_quantity == 100
-        assert orders[0].is_buy
-
-    def test_add_single_sell_signal(self):
-        """Test adding a single sell signal."""
-        engine = OrderNettingEngine()
-        signal = TradingSignal(
+    def test_create_sell_order(self):
+        """Test creating a sell order."""
+        order = AccumulatedOrder(
             strategy_id="strategy_a",
             symbol="000001.SZ",
-            quantity=-100
+            side="sell",
+            quantity=50
         )
-        engine.add_signal(signal)
-        orders = engine.get_netted_orders()
+        assert order.side == "sell"
+        assert order.quantity == 50
 
-        assert len(orders) == 1
-        assert orders[0].symbol == "000001.SZ"
-        assert orders[0].net_quantity == -100
-        assert orders[0].is_sell
 
-    def test_netting_buy_and_sell_cancel_out(self):
-        """Test that buy and sell signals for same symbol cancel out."""
-        engine = OrderNettingEngine(min_net_quantity=1.0)
+class TestNettedOrder:
+    """Tests for the NettedOrder dataclass."""
 
-        # Strategy A wants to buy 100
-        engine.add_signal(TradingSignal(
-            strategy_id="strategy_a",
-            symbol="000001.SZ",
-            quantity=100
-        ))
+    def test_should_execute_positive(self):
+        """Test should_execute with positive quantity."""
+        order = NettedOrder(symbol="000001.SZ", net_quantity=100)
+        assert order.should_execute is True
 
-        # Strategy B wants to sell 100
-        engine.add_signal(TradingSignal(
-            strategy_id="strategy_b",
-            symbol="000001.SZ",
-            quantity=-100
-        ))
+    def test_should_execute_negative(self):
+        """Test should_execute with negative quantity."""
+        order = NettedOrder(symbol="000001.SZ", net_quantity=-100)
+        assert order.should_execute is True
 
-        orders = engine.get_netted_orders()
+    def test_should_execute_zero(self):
+        """Test should_execute with zero quantity."""
+        order = NettedOrder(symbol="000001.SZ", net_quantity=0)
+        assert order.should_execute is False
+
+    def test_side_buy(self):
+        """Test side property for buy."""
+        order = NettedOrder(symbol="000001.SZ", net_quantity=100)
+        assert order.side == "buy"
+
+    def test_side_sell(self):
+        """Test side property for sell."""
+        order = NettedOrder(symbol="000001.SZ", net_quantity=-100)
+        assert order.side == "sell"
+
+    def test_abs_quantity(self):
+        """Test absolute quantity property."""
+        order = NettedOrder(symbol="000001.SZ", net_quantity=-150)
+        assert order.abs_quantity == 150
+
+    def test_component_orders_tracking(self):
+        """Test that component orders are tracked."""
+        components = [
+            AccumulatedOrder(strategy_id="a", symbol="TEST", side="buy", quantity=100),
+            AccumulatedOrder(strategy_id="b", symbol="TEST", side="sell", quantity=50),
+        ]
+        order = NettedOrder(symbol="TEST", net_quantity=50, component_orders=components)
+        assert len(order.component_orders) == 2
+
+
+class TestOrderInterceptor:
+    """Tests for the OrderInterceptor class."""
+
+    def test_interception_mode(self):
+        """Test starting and stopping interception."""
+        mock_strategy = MagicMock()
+        mock_strategy.broker = MagicMock()
+
+        interceptor = OrderInterceptor(mock_strategy)
+
+        assert interceptor._is_intercepting is False
+
+        interceptor.start_interception()
+        assert interceptor._is_intercepting is True
+
+        interceptor.stop_interception()
+        assert interceptor._is_intercepting is False
+
+    def test_get_netted_orders_buy_and_sell_cancel_out(self):
+        """Test that buy and sell orders for same symbol cancel out."""
+        mock_strategy = MagicMock()
+        mock_strategy.broker = MagicMock()
+
+        interceptor = OrderInterceptor(mock_strategy, min_net_quantity=1.0)
+        interceptor.start_interception()
+
+        # Add buy order
+        buy_order = MagicMock()
+        buy_order.asset.symbol = "000001.SZ"
+        buy_order.side = "buy"
+        buy_order.quantity = 100
+        interceptor.intercept_order(buy_order, "strategy_a")
+
+        # Add sell order
+        sell_order = MagicMock()
+        sell_order.asset.symbol = "000001.SZ"
+        sell_order.side = "sell"
+        sell_order.quantity = 100
+        interceptor.intercept_order(sell_order, "strategy_b")
+
+        # Get netted orders
+        netted = interceptor.get_netted_orders()
 
         # Should be no orders since 100 - 100 = 0
-        assert len(orders) == 0
+        assert len(netted) == 0
 
-    def test_netting_partial_cancel(self):
-        """Test partial cancellation of signals."""
-        engine = OrderNettingEngine(min_net_quantity=1.0)
+    def test_get_netted_orders_partial_cancel(self):
+        """Test partial cancellation of orders."""
+        mock_strategy = MagicMock()
+        mock_strategy.broker = MagicMock()
 
-        # Strategy A wants to buy 150
-        engine.add_signal(TradingSignal(
-            strategy_id="strategy_a",
-            symbol="000001.SZ",
-            quantity=150
-        ))
+        interceptor = OrderInterceptor(mock_strategy, min_net_quantity=1.0)
+        interceptor.start_interception()
 
-        # Strategy B wants to sell 100
-        engine.add_signal(TradingSignal(
-            strategy_id="strategy_b",
-            symbol="000001.SZ",
-            quantity=-100
-        ))
+        # Add buy order for 150
+        buy_order = MagicMock()
+        buy_order.asset.symbol = "000001.SZ"
+        buy_order.side = "buy"
+        buy_order.quantity = 150
+        interceptor.intercept_order(buy_order, "strategy_a")
 
-        orders = engine.get_netted_orders()
+        # Add sell order for 100
+        sell_order = MagicMock()
+        sell_order.asset.symbol = "000001.SZ"
+        sell_order.side = "sell"
+        sell_order.quantity = 100
+        interceptor.intercept_order(sell_order, "strategy_b")
+
+        # Get netted orders
+        netted = interceptor.get_netted_orders()
 
         # Should have 1 order for net 50
-        assert len(orders) == 1
-        assert orders[0].net_quantity == 50
-        assert orders[0].is_buy
+        assert len(netted) == 1
+        assert netted[0].net_quantity == 50
+        assert netted[0].side == "buy"
 
-    def test_netting_multiple_strategies_same_direction(self):
+    def test_get_netted_orders_multiple_strategies_same_direction(self):
         """Test multiple strategies buying same symbol."""
-        engine = OrderNettingEngine()
+        mock_strategy = MagicMock()
+        mock_strategy.broker = MagicMock()
 
-        engine.add_signal(TradingSignal(strategy_id="a", symbol="000001.SZ", quantity=100))
-        engine.add_signal(TradingSignal(strategy_id="b", symbol="000001.SZ", quantity=150))
-        engine.add_signal(TradingSignal(strategy_id="c", symbol="000001.SZ", quantity=50))
+        interceptor = OrderInterceptor(mock_strategy)
+        interceptor.start_interception()
 
-        orders = engine.get_netted_orders()
+        for i, qty in enumerate([100, 150, 50]):
+            order = MagicMock()
+            order.asset.symbol = "000001.SZ"
+            order.side = "buy"
+            order.quantity = qty
+            interceptor.intercept_order(order, f"strategy_{i}")
 
-        assert len(orders) == 1
-        assert orders[0].net_quantity == 300
-        assert len(orders[0].component_signals) == 3
+        netted = interceptor.get_netted_orders()
 
-    def test_netting_different_symbols(self):
-        """Test netting for multiple symbols."""
-        engine = OrderNettingEngine()
+        assert len(netted) == 1
+        assert netted[0].net_quantity == 300
+        assert len(netted[0].component_orders) == 3
 
-        engine.add_signal(TradingSignal(strategy_id="a", symbol="000001.SZ", quantity=100))
-        engine.add_signal(TradingSignal(strategy_id="b", symbol="000001.SZ", quantity=-50))
-        engine.add_signal(TradingSignal(strategy_id="a", symbol="600519.SH", quantity=-200))
-        engine.add_signal(TradingSignal(strategy_id="c", symbol="600519.SH", quantity=100))
+    def test_get_netted_orders_different_symbols(self):
+        """Test netting for different symbols."""
+        mock_strategy = MagicMock()
+        mock_strategy.broker = MagicMock()
 
-        orders = engine.get_netted_orders()
+        # Use low threshold so both symbols are included
+        interceptor = OrderInterceptor(mock_strategy, min_net_quantity=1.0)
+        interceptor.start_interception()
+
+        # Symbol 1: buy 100, sell 50 = net 50
+        order1 = MagicMock()
+        order1.asset.symbol = "000001.SZ"
+        order1.side = "buy"
+        order1.quantity = 100
+        interceptor.intercept_order(order1, "a")
+
+        order2 = MagicMock()
+        order2.asset.symbol = "000001.SZ"
+        order2.side = "sell"
+        order2.quantity = 50
+        interceptor.intercept_order(order2, "b")
+
+        # Symbol 2: sell 200, buy 100 = net -100
+        order3 = MagicMock()
+        order3.asset.symbol = "600519.SH"
+        order3.side = "sell"
+        order3.quantity = 200
+        interceptor.intercept_order(order3, "c")
+
+        order4 = MagicMock()
+        order4.asset.symbol = "600519.SH"
+        order4.side = "buy"
+        order4.quantity = 100
+        interceptor.intercept_order(order4, "d")
+
+        netted = interceptor.get_netted_orders()
 
         # Should have 2 orders (one per symbol)
-        assert len(orders) == 2
+        assert len(netted) == 2
 
-        sz_order = next(o for o in orders if o.symbol == "000001.SZ")
-        sh_order = next(o for o in orders if o.symbol == "600519.SH")
+        sz_order = next(o for o in netted if o.symbol == "000001.SZ")
+        sh_order = next(o for o in netted if o.symbol == "600519.SH")
 
         assert sz_order.net_quantity == 50  # 100 - 50
         assert sh_order.net_quantity == -100  # -200 + 100
 
     def test_min_net_quantity_threshold(self):
         """Test minimum quantity threshold."""
-        engine = OrderNettingEngine(min_net_quantity=100)
+        mock_strategy = MagicMock()
+        mock_strategy.broker = MagicMock()
+
+        interceptor = OrderInterceptor(mock_strategy, min_net_quantity=100)
+        interceptor.start_interception()
 
         # Net quantity is 50, below threshold
-        engine.add_signal(TradingSignal(strategy_id="a", symbol="000001.SZ", quantity=100))
-        engine.add_signal(TradingSignal(strategy_id="b", symbol="000001.SZ", quantity=-50))
+        order1 = MagicMock()
+        order1.asset.symbol = "000001.SZ"
+        order1.side = "buy"
+        order1.quantity = 100
+        interceptor.intercept_order(order1, "a")
 
-        orders = engine.get_netted_orders()
+        order2 = MagicMock()
+        order2.asset.symbol = "000001.SZ"
+        order2.side = "sell"
+        order2.quantity = 50
+        interceptor.intercept_order(order2, "b")
 
-        # Should be filtered out
-        assert len(orders) == 0
+        netted = interceptor.get_netted_orders()
 
-    def test_clear_signals(self):
-        """Test clearing signals."""
-        engine = OrderNettingEngine()
-        engine.add_signal(TradingSignal(strategy_id="a", symbol="000001.SZ", quantity=100))
+        # Should be filtered out (50 < 100)
+        assert len(netted) == 0
 
-        engine.clear_signals()
-        orders = engine.get_netted_orders()
+    def test_get_accumulation_summary(self):
+        """Test getting accumulation summary."""
+        mock_strategy = MagicMock()
+        mock_strategy.broker = MagicMock()
 
-        assert len(orders) == 0
+        interceptor = OrderInterceptor(mock_strategy)
+        interceptor.start_interception()
 
-    def test_get_netting_summary(self):
-        """Test getting netting summary."""
-        engine = OrderNettingEngine()
+        order1 = MagicMock()
+        order1.asset.symbol = "000001.SZ"
+        order1.side = "buy"
+        order1.quantity = 100
+        interceptor.intercept_order(order1, "strategy_a")
 
-        engine.add_signal(TradingSignal(strategy_id="a", symbol="000001.SZ", quantity=100))
-        engine.add_signal(TradingSignal(strategy_id="b", symbol="000001.SZ", quantity=-50))
+        order2 = MagicMock()
+        order2.asset.symbol = "000001.SZ"
+        order2.side = "sell"
+        order2.quantity = 50
+        interceptor.intercept_order(order2, "strategy_b")
 
-        summary = engine.get_netting_summary()
+        summary = interceptor.get_accumulation_summary()
 
         assert "000001.SZ" in summary
-        assert summary["000001.SZ"]["signal_count"] == 2
+        assert summary["000001.SZ"]["order_count"] == 2
         assert summary["000001.SZ"]["net_quantity"] == 50
-        assert "a" in summary["000001.SZ"]["strategies"]
-        assert "b" in summary["000001.SZ"]["strategies"]
+        assert "strategy_a" in summary["000001.SZ"]["strategies"]
+        assert "strategy_b" in summary["000001.SZ"]["strategies"]
 
 
-class TestPortfolioPositionManager:
-    """Tests for the PortfolioPositionManager class."""
+class TestRunStrategyWithInterception:
+    """Tests for the run_strategy_with_interception function."""
 
-    def test_update_position_buy(self):
-        """Test updating position after a buy."""
-        manager = PortfolioPositionManager()
-
-        manager.update_position("strategy_a", "000001.SZ", 100, 10.0)
-
-        pos = manager.get_portfolio_position("000001.SZ")
-        assert pos["quantity"] == 100
-        assert pos["avg_cost"] == 10.0
-
-    def test_update_position_multiple_buys(self):
-        """Test average cost calculation with multiple buys."""
-        manager = PortfolioPositionManager()
-
-        manager.update_position("strategy_a", "000001.SZ", 100, 10.0)
-        manager.update_position("strategy_a", "000001.SZ", 100, 12.0)
-
-        pos = manager.get_portfolio_position("000001.SZ")
-        assert pos["quantity"] == 200
-        assert pos["avg_cost"] == 11.0  # (100*10 + 100*12) / 200
-
-    def test_update_position_sell(self):
-        """Test updating position after a sell."""
-        manager = PortfolioPositionManager()
-
-        manager.update_position("strategy_a", "000001.SZ", 100, 10.0)
-        manager.update_position("strategy_a", "000001.SZ", -50, 12.0)
-
-        pos = manager.get_portfolio_position("000001.SZ")
-        assert pos["quantity"] == 50
-
-    def test_sub_strategy_positions(self):
-        """Test tracking positions per sub-strategy."""
-        manager = PortfolioPositionManager()
-
-        manager.update_position("strategy_a", "000001.SZ", 100, 10.0)
-        manager.update_position("strategy_b", "000001.SZ", 50, 10.0)
-
-        pos_a = manager.get_strategy_position("strategy_a", "000001.SZ")
-        pos_b = manager.get_strategy_position("strategy_b", "000001.SZ")
-        total = manager.get_portfolio_position("000001.SZ")
-
-        assert pos_a == 100
-        assert pos_b == 50
-        assert total["quantity"] == 150
-
-    def test_get_all_positions(self):
-        """Test getting all positions."""
-        manager = PortfolioPositionManager()
-
-        manager.update_position("a", "000001.SZ", 100, 10.0)
-        manager.update_position("b", "600519.SH", 200, 20.0)
-
-        all_pos = manager.get_all_positions()
-
-        assert len(all_pos) == 2
-        assert "000001.SZ" in all_pos
-        assert "600519.SH" in all_pos
-
-
-class TestTradingSignal:
-    """Tests for the TradingSignal dataclass."""
-
-    def test_is_buy_is_sell_properties(self):
-        """Test is_buy and is_sell properties."""
-        buy_signal = TradingSignal(strategy_id="a", symbol="TEST", quantity=100)
-        sell_signal = TradingSignal(strategy_id="a", symbol="TEST", quantity=-100)
-        hold_signal = TradingSignal(strategy_id="a", symbol="TEST", quantity=0)
-
-        assert buy_signal.is_buy
-        assert not buy_signal.is_sell
-
-        assert sell_signal.is_sell
-        assert not sell_signal.is_buy
-
-        assert not hold_signal.is_buy
-        assert not hold_signal.is_sell
-
-    def test_abs_quantity(self):
-        """Test absolute quantity property."""
-        signal = TradingSignal(strategy_id="a", symbol="TEST", quantity=-150)
-        assert signal.abs_quantity == 150
-
-
-class TestNettedOrder:
-    """Tests for the NettedOrder dataclass."""
-
-    def test_should_execute(self):
-        """Test should_execute property."""
-        order_with_qty = NettedOrder(symbol="TEST", net_quantity=100)
-        order_zero = NettedOrder(symbol="TEST", net_quantity=0)
-
-        assert order_with_qty.should_execute
-        assert not order_zero.should_execute
-
-    def test_is_buy_is_sell(self):
-        """Test is_buy and is_sell properties."""
-        buy_order = NettedOrder(symbol="TEST", net_quantity=100)
-        sell_order = NettedOrder(symbol="TEST", net_quantity=-100)
-
-        assert buy_order.is_buy
-        assert not buy_order.is_sell
-
-        assert sell_order.is_sell
-        assert not sell_order.is_buy
-
-    def test_component_signals_tracking(self):
-        """Test that component signals are tracked."""
-        signals = [
-            TradingSignal(strategy_id="a", symbol="TEST", quantity=100),
-            TradingSignal(strategy_id="b", symbol="TEST", quantity=50),
-        ]
-        order = NettedOrder(symbol="TEST", net_quantity=150, component_signals=signals)
-
-        assert len(order.component_signals) == 2
-        assert order.net_quantity == 150
-
-
-class TestStrategyWrapper:
-    """Tests for the StrategyWrapper class."""
-
-    def test_signal_interception(self):
-        """Test that signals are intercepted from wrapped strategy."""
-        from lumibot.strategies import Strategy
-
-        # Create a simple test strategy
-        class TestStrategy(Strategy):
-            def initialize(self, param1=10):
-                self.param1 = param1
-
-            def on_trading_iteration(self):
-                from lumibot.entities import Asset, Order
-                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
-                order = self.create_order(asset, 100, "buy")
-                self.submit_order(order)
-
-        # Create mock main strategy
-        mock_main = MagicMock()
-        mock_main._broker = MagicMock()
-        mock_main._data_source = MagicMock()
-        mock_main.datetime = datetime.now()
-
-        # Create portfolio
-        portfolio = PortfolioStrategy(mock_main)
-
-        # Add strategy
-        wrapper = portfolio.add_strategy(TestStrategy, "test", param1=20)
-
-        # Run iteration
-        signals = portfolio.run_iteration()
-
-        # Check signals were intercepted
-        assert len(signals) == 1
-        assert signals[0].symbol == "000001.SZ"
-        assert signals[0].quantity == 100
-
-
-class TestPortfolioStrategy:
-    """Tests for the PortfolioStrategy class."""
-
-    def test_add_strategy(self):
-        """Test adding strategies."""
-        from lumibot.strategies import Strategy
-
-        class DummyStrategy(Strategy):
-            def initialize(self):
-                pass
-            def on_trading_iteration(self):
-                pass
-
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        portfolio.add_strategy(DummyStrategy, "test_strategy")
-
-        assert "test_strategy" in portfolio.get_all_strategies()
-
-    def test_remove_strategy(self):
-        """Test removing strategies."""
-        from lumibot.strategies import Strategy
-
-        class DummyStrategy(Strategy):
-            def initialize(self):
-                pass
-            def on_trading_iteration(self):
-                pass
-
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        portfolio.add_strategy(DummyStrategy, "test_strategy")
-        removed = portfolio.remove_strategy("test_strategy")
-
-        assert removed is not None
-        assert "test_strategy" not in portfolio.get_all_strategies()
-
-    def test_duplicate_strategy_id(self):
-        """Test that duplicate IDs raise an error."""
-        from lumibot.strategies import Strategy
-
-        class DummyStrategy(Strategy):
-            def initialize(self):
-                pass
-            def on_trading_iteration(self):
-                pass
-
-        mock_main = MagicMock()
-        portfolio = PortfolioStrategy(mock_main)
-
-        portfolio.add_strategy(DummyStrategy, "test_strategy")
-
-        with pytest.raises(ValueError):
-            portfolio.add_strategy(DummyStrategy, "test_strategy")
-
-    def test_run_iteration_collects_signals(self):
-        """Test that run_iteration collects signals from all strategies."""
-        from lumibot.strategies import Strategy
-        from lumibot.entities import Asset
-
-        class BuyStrategy(Strategy):
-            def initialize(self):
-                pass
-            def on_trading_iteration(self):
-                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
-                order = self.create_order(asset, 100, "buy")
-                self.submit_order(order)
-
-        class SellStrategy(Strategy):
-            def initialize(self):
-                pass
-            def on_trading_iteration(self):
-                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
-                order = self.create_order(asset, 50, "sell")
-                self.submit_order(order)
-
-        mock_main = MagicMock()
-        mock_main._broker = MagicMock()
-        mock_main._data_source = MagicMock()
-        mock_main.datetime = datetime.now()
-
-        portfolio = PortfolioStrategy(mock_main)
-        portfolio.add_strategy(BuyStrategy, "buyer")
-        portfolio.add_strategy(SellStrategy, "seller")
-
-        signals = portfolio.run_iteration()
-
-        assert len(signals) == 2
-        assert any(s.quantity == 100 for s in signals)
-        assert any(s.quantity == -50 for s in signals)
-
-    def test_netted_orders_from_signals(self):
-        """Test getting netted orders from collected signals."""
-        from lumibot.strategies import Strategy
-        from lumibot.entities import Asset
-
-        class BuyStrategy(Strategy):
-            def initialize(self):
-                pass
-            def on_trading_iteration(self):
-                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
-                order = self.create_order(asset, 100, "buy")
-                self.submit_order(order)
-
-        class SellStrategy(Strategy):
-            def initialize(self):
-                pass
-            def on_trading_iteration(self):
-                asset = Asset(symbol="000001.SZ", asset_type=Asset.AssetType.STOCK)
-                order = self.create_order(asset, 100, "sell")
-                self.submit_order(order)
-
-        mock_main = MagicMock()
-        mock_main._broker = MagicMock()
-        mock_main._data_source = MagicMock()
-        mock_main.datetime = datetime.now()
-
-        portfolio = PortfolioStrategy(mock_main)
-        portfolio.add_strategy(BuyStrategy, "buyer")
-        portfolio.add_strategy(SellStrategy, "seller")
-
-        portfolio.run_iteration()
-        orders = portfolio.get_netted_orders()
-
-        # Net should be 0, so no orders
-        assert len(orders) == 0
+    def test_function_exists(self):
+        """Test that the function exists and is callable."""
+        assert callable(run_strategy_with_interception)
 
 
 if __name__ == "__main__":

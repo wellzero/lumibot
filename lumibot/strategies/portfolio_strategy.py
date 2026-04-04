@@ -1,69 +1,72 @@
 """
-Portfolio Strategy System for LumiBot
+Portfolio Strategy System for LumiBot - Order Interception Approach
 
-This module implements a portfolio-level strategy management system similar to VNPy's
-PortfolioStrategy, providing order netting, position aggregation, and multi-strategy
-coordination.
+This module implements portfolio-level order netting by intercepting orders
+at the broker level, similar to VNPy's PortfolioStrategy architecture.
 
 Key Features:
-- Combine signals from multiple strategies
-- Order netting (combines buy/sell for same symbol)
-- Position aggregation at portfolio level
-- Cross-strategy coordination
+- Intercept submit_order() calls from sub-strategies
+- Accumulate orders per symbol
+- Net opposing orders (buy vs sell) before execution
+- Single execution point with flushed netted orders
 
-Example:
-    >>> # In your main strategy's on_trading_iteration:
-    >>> signals = []
-    >>> signals.extend(gap_fade_strategy.generate_signals(self))
-    >>> signals.extend(momentum_strategy.generate_signals(self))
-    >>>
-    >>> netted = self.portfolio.net_signals(signals)
-    >>> self.portfolio.execute_netted(netted)
+Usage:
+    # In your main strategy's initialize:
+    from lumibot.strategies.portfolio_strategy import OrderInterceptor, run_strategy_with_interception
+
+    self.interceptor = OrderInterceptor(self, min_net_quantity=100)
+
+    # In on_trading_iteration:
+    self.interceptor.start_interception()
+
+    # Run sub-strategies (orders are intercepted)
+    run_strategy_with_interception(sub_strategy, "strategy_id", self.interceptor)
+
+    # Net and execute orders
+    executed = self.interceptor.execute_netted_orders(strategy=self, lot_size=100)
+
+How Order Interception Works:
+    1. Sub-strategies call submit_order() normally
+    2. OrderInterceptor intercepts and accumulates orders (no real submission)
+    3. After all sub-strategies run, execute_netted_orders() is called
+    4. Netted orders are calculated and submitted to real broker
+    5. Only ONE order per symbol is actually executed
 """
 
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Type, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, Type, TYPE_CHECKING
+
+from lumibot.strategies.strategy import Strategy
 
 if TYPE_CHECKING:
     from lumibot.entities import Asset, Order, Position
-    from lumibot.strategies.strategy import Strategy
+    from lumibot.brokers import Broker
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TradingSignal:
-    """Represents a trading signal from a strategy."""
+class AccumulatedOrder:
+    """Represents an accumulated order before netting."""
     strategy_id: str
     symbol: str
-    quantity: float  # Positive for buy, negative for sell
-    price: Optional[float] = None  # Limit price, None for market
+    side: str  # "buy" or "sell"
+    quantity: float
+    price: Optional[float] = None
+    order_type: str = "market"
     timestamp: datetime = field(default_factory=datetime.now)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    order_type: str = "market"  # "market" or "limit"
-
-    @property
-    def is_buy(self) -> bool:
-        return self.quantity > 0
-
-    @property
-    def is_sell(self) -> bool:
-        return self.quantity < 0
-
-    @property
-    def abs_quantity(self) -> float:
-        return abs(self.quantity)
+    original_order: Optional['Order'] = None
 
 
 @dataclass
 class NettedOrder:
-    """Represents a netted order after aggregating signals."""
+    """Represents a netted order ready for execution."""
     symbol: str
-    net_quantity: float
-    component_signals: List[TradingSignal] = field(default_factory=list)
+    net_quantity: float  # Positive for buy, negative for sell
+    component_orders: List[AccumulatedOrder] = field(default_factory=list)
     price: Optional[float] = None
 
     @property
@@ -72,232 +75,230 @@ class NettedOrder:
         return self.net_quantity != 0
 
     @property
-    def is_buy(self) -> bool:
-        return self.net_quantity > 0
-
-    @property
-    def is_sell(self) -> bool:
-        return self.net_quantity < 0
+    def side(self) -> str:
+        """Returns 'buy' for positive, 'sell' for negative."""
+        return "buy" if self.net_quantity > 0 else "sell"
 
     @property
     def abs_quantity(self) -> float:
+        """Returns absolute quantity."""
         return abs(self.net_quantity)
 
 
-class OrderNettingEngine:
+class OrderInterceptor:
     """
-    Engine for netting orders across multiple strategies.
+    Intercepts orders from sub-strategies and nets them before execution.
 
-    Aggregates trading signals and combines orders for the same symbol,
-    reducing unnecessary trades when signals offset each other.
+    This is the core component for order interception approach:
+    1. Start interception mode
+    2. Sub-strategies call submit_order() -> orders are accumulated
+    3. Stop interception and calculate netted orders
+    4. Execute only netted orders to real broker
+
+    Example:
+        interceptor = OrderInterceptor(main_strategy, min_net_quantity=100)
+
+        # Start intercepting
+        interceptor.start_interception()
+
+        # Run sub-strategies (orders are caught, not executed)
+        run_strategy_with_interception(strategy_a, "strategy_a", interceptor)
+        run_strategy_with_interception(strategy_b, "strategy_b", interceptor)
+
+        # Net and execute
+        executed = interceptor.execute_netted_orders(
+            strategy=main_strategy,
+            lot_size=100,
+            max_positions=10,
+            position_dict=positions
+        )
+
+    Order Netting Example:
+        Strategy A: BUY 600519.SH x 100
+        Strategy B: SELL 600519.SH x 50
+        Net result: BUY 600519.SH x 50 (ONE order executed)
     """
 
-    def __init__(self, min_net_quantity: float = 1.0):
+    def __init__(self, main_strategy: 'Strategy', min_net_quantity: float = 100):
         """
-        Initialize the order netting engine.
+        Initialize the order interceptor.
 
         Args:
-            min_net_quantity: Minimum absolute quantity to execute after netting.
-                            Orders with |net_quantity| < min_net_quantity are ignored.
+            main_strategy: The main portfolio strategy
+            min_net_quantity: Minimum quantity threshold for netted orders
         """
+        self.main_strategy = main_strategy
         self.min_net_quantity = min_net_quantity
-        self._signals: Dict[str, List[TradingSignal]] = defaultdict(list)
+        self._accumulated_orders: Dict[str, List[AccumulatedOrder]] = {}
+        self._is_intercepting = False
+        self._original_submit_methods: Dict[str, Any] = {}
 
-    def add_signal(self, signal: TradingSignal) -> None:
-        """Add a trading signal to the netting engine."""
-        self._signals[signal.symbol].append(signal)
-        logger.debug(f"[OrderNetting] Added signal: {signal.strategy_id} -> "
-                    f"{signal.symbol} qty={signal.quantity}")
+    def start_interception(self):
+        """
+        Start intercepting orders.
 
-    def add_signals(self, signals: List[TradingSignal]) -> None:
-        """Add multiple trading signals."""
-        for signal in signals:
-            self.add_signal(signal)
+        All subsequent submit_order() calls will be accumulated
+        instead of being sent to the real broker.
+        """
+        self._accumulated_orders.clear()
+        self._original_submit_methods.clear()
+        self._is_intercepting = True
+        logger.debug("[OrderInterceptor] Started intercepting orders")
 
-    def clear_signals(self) -> None:
-        """Clear all pending signals."""
-        self._signals.clear()
+    def stop_interception(self):
+        """
+        Stop intercepting orders.
+
+        Subsequent submit_order() calls will pass through to real broker.
+        """
+        self._is_intercepting = False
+        logger.debug("[OrderInterceptor] Stopped intercepting orders")
+
+    def intercept_order(self, order: 'Order', strategy_id: str) -> Optional['Order']:
+        """
+        Intercept an order from a sub-strategy.
+
+        During interception mode, orders are stored instead of submitted.
+        Outside interception mode, orders pass through to real broker.
+
+        Args:
+            order: The order to intercept
+            strategy_id: ID of the strategy submitting the order
+
+        Returns:
+            During interception: None (order is stored)
+            Outside interception: The submitted order from real broker
+        """
+        if not self._is_intercepting:
+            # Pass through to real broker
+            return self.main_strategy.broker.submit_order(order)
+
+        # Extract symbol from order
+        symbol = order.asset.symbol if hasattr(order.asset, 'symbol') else str(order.asset)
+
+        # Create accumulated order record
+        accumulated = AccumulatedOrder(
+            strategy_id=strategy_id,
+            symbol=symbol,
+            side=order.side,
+            quantity=order.quantity,
+            price=getattr(order, 'limit_price', None),
+            order_type=getattr(order, 'order_type', 'market'),
+            original_order=order
+        )
+
+        # Store by symbol
+        if symbol not in self._accumulated_orders:
+            self._accumulated_orders[symbol] = []
+        self._accumulated_orders[symbol].append(accumulated)
+
+        logger.debug(f"[OrderInterceptor] Intercepted: {strategy_id} -> "
+                    f"{order.side} {symbol} x {order.quantity}")
+
+        return None  # No order submitted yet
 
     def get_netted_orders(self) -> List[NettedOrder]:
         """
-        Calculate netted orders from all signals.
+        Calculate netted orders from accumulated orders.
 
         Returns:
-            List of NettedOrder objects representing the aggregated orders
+            List of NettedOrder objects with net quantities per symbol
         """
         netted_orders = []
 
-        for symbol, signals in self._signals.items():
-            if not signals:
+        for symbol, orders in self._accumulated_orders.items():
+            if not orders:
                 continue
 
-            # Sum all quantities for the same symbol
-            net_quantity = sum(s.quantity for s in signals)
+            # Calculate net quantity (buy = +, sell = -)
+            net_quantity = 0.0
+            prices = []
 
-            # Get average limit price if specified
-            prices = [s.price for s in signals if s.price is not None]
+            for o in orders:
+                if o.side == "buy":
+                    net_quantity += o.quantity
+                else:  # sell
+                    net_quantity -= o.quantity
+
+                if o.price is not None:
+                    prices.append(o.price)
+
+            # Get average price if specified
             avg_price = sum(prices) / len(prices) if prices else None
 
             # Create netted order
             netted = NettedOrder(
                 symbol=symbol,
                 net_quantity=net_quantity,
-                component_signals=signals,
+                component_orders=orders,
                 price=avg_price
             )
 
             # Only include if meets minimum quantity threshold
             if abs(net_quantity) >= self.min_net_quantity:
                 netted_orders.append(netted)
-                logger.info(f"[OrderNetting] Netted order: {symbol} -> "
-                           f"net_qty={net_quantity} (from {len(signals)} signals)")
+                logger.info(f"[OrderInterceptor] Netted: {symbol} -> "
+                           f"{'buy' if net_quantity > 0 else 'sell'} {abs(net_quantity)} "
+                           f"(from {len(orders)} orders)")
             else:
-                logger.info(f"[OrderNetting] Order netted to zero for {symbol}: "
-                           f"net_qty={net_quantity}")
+                logger.info(f"[OrderInterceptor] Netted to zero: {symbol} "
+                           f"(net_qty={net_quantity}, below threshold)")
 
         return netted_orders
 
-    def get_netting_summary(self) -> Dict[str, Dict]:
-        """Get a summary of the netting process."""
+    def get_accumulation_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of accumulated orders before netting.
+
+        Returns:
+            Dict with order details per symbol
+        """
         summary = {}
-        for symbol, signals in self._signals.items():
-            net_qty = sum(s.quantity for s in signals)
+        for symbol, orders in self._accumulated_orders.items():
+            net_qty = sum(
+                o.quantity if o.side == "buy" else -o.quantity
+                for o in orders
+            )
             summary[symbol] = {
-                "signal_count": len(signals),
+                "order_count": len(orders),
                 "net_quantity": net_qty,
-                "strategies": list(set(s.strategy_id for s in signals)),
-                "signals": [
-                    {"strategy": s.strategy_id, "qty": s.quantity, "price": s.price}
-                    for s in signals
+                "strategies": list(set(o.strategy_id for o in orders)),
+                "orders": [
+                    {"strategy": o.strategy_id, "side": o.side, "qty": o.quantity}
+                    for o in orders
                 ]
             }
         return summary
 
-
-class PortfolioPositionManager:
-    """Manages positions at the portfolio level across all strategies."""
-
-    def __init__(self):
-        self._positions: Dict[str, Dict[str, Any]] = defaultdict(
-            lambda: {"quantity": 0.0, "avg_cost": 0.0, "strategy_positions": {}}
-        )
-        self._strategy_positions: Dict[str, Dict[str, float]] = defaultdict(dict)
-
-    def update_position(self, strategy_id: str, symbol: str, quantity: float, price: float) -> None:
-        """Update position after a trade execution."""
-        # Update strategy-level position
-        old_qty = self._strategy_positions[strategy_id].get(symbol, 0.0)
-        new_qty = old_qty + quantity
-        self._strategy_positions[strategy_id][symbol] = new_qty
-
-        # Update portfolio-level position
-        old_portfolio_qty = self._positions[symbol]["quantity"]
-        new_portfolio_qty = old_portfolio_qty + quantity
-        self._positions[symbol]["quantity"] = new_portfolio_qty
-
-        # Update average cost
-        if quantity > 0:  # Buying
-            if new_portfolio_qty > 0:
-                old_cost = self._positions[symbol]["avg_cost"] * old_portfolio_qty
-                new_cost = price * quantity
-                self._positions[symbol]["avg_cost"] = (old_cost + new_cost) / new_portfolio_qty
-
-        logger.debug(f"[PositionManager] Updated: {strategy_id} {symbol} "
-                    f"qty={old_qty}→{new_qty}")
-
-    def get_portfolio_position(self, symbol: str) -> Dict[str, Any]:
-        """Get portfolio-level position for a symbol."""
-        return dict(self._positions[symbol])
-
-    def get_strategy_position(self, strategy_id: str, symbol: str) -> float:
-        """Get a strategy's position in a symbol."""
-        return self._strategy_positions[strategy_id].get(symbol, 0.0)
-
-    def get_all_positions(self) -> Dict[str, Dict[str, Any]]:
-        """Get all portfolio positions."""
-        return {k: dict(v) for k, v in self._positions.items() if v["quantity"] != 0}
-
-    def get_strategy_positions(self, strategy_id: str) -> Dict[str, float]:
-        """Get all positions for a specific strategy."""
-        return dict(self._strategy_positions[strategy_id])
-
-
-class PortfolioStrategyHelper:
-    """
-    Helper class for portfolio strategy with order netting.
-
-    This class provides utility methods for combining signals from multiple
-    strategies and netting them before execution.
-
-    Usage:
-        # In your main strategy's initialize:
-        self.portfolio = PortfolioStrategyHelper(min_net_quantity=100)
-
-        # In on_trading_iteration:
-        # 1. Collect signals from your signal generators
-        signals = []
-        signals.extend(self.generate_gap_fade_signals())
-        signals.extend(self.generate_momentum_signals())
-
-        # 2. Add to netting engine
-        self.portfolio.add_signals(signals)
-
-        # 3. Get netted orders
-        netted = self.portfolio.get_netted_orders()
-
-        # 4. Execute
-        self.portfolio.execute_netted_orders(netted, self)
-    """
-
-    def __init__(self, min_net_quantity: float = 1.0):
+    def execute_netted_orders(self, strategy: Optional['Strategy'] = None,
+                               lot_size: int = 100,
+                               max_positions: int = 10,
+                               position_dict: Optional[Dict] = None) -> List['Order']:
         """
-        Initialize the portfolio strategy helper.
+        Execute netted orders to the real broker.
+
+        This is the key method that:
+        1. Calculates net quantities per symbol
+        2. Creates orders for net quantities
+        3. Submits to real broker
 
         Args:
-            min_net_quantity: Minimum quantity threshold for netted orders
-        """
-        self.netting_engine = OrderNettingEngine(min_net_quantity)
-        self.position_manager = PortfolioPositionManager()
-        self._iteration_count = 0
-
-    def add_signal(self, signal: TradingSignal) -> None:
-        """Add a signal to the netting engine."""
-        self.netting_engine.add_signal(signal)
-
-    def add_signals(self, signals: List[TradingSignal]) -> None:
-        """Add multiple signals to the netting engine."""
-        self.netting_engine.add_signals(signals)
-
-    def clear_signals(self) -> None:
-        """Clear all pending signals."""
-        self.netting_engine.clear_signals()
-
-    def get_netted_orders(self) -> List[NettedOrder]:
-        """Get netted orders from collected signals."""
-        return self.netting_engine.get_netted_orders()
-
-    def execute_netted_orders(self, orders: List[NettedOrder], strategy: 'Strategy',
-                              lot_size: int = 100, max_positions: int = 10,
-                              position_dict: Optional[Dict] = None) -> List['Order']:
-        """
-        Execute netted orders through the strategy.
-
-        Args:
-            orders: List of netted orders to execute
-            strategy: The strategy to execute through
+            strategy: The main strategy to create orders through (default: self.main_strategy)
             lot_size: Lot size for rounding (default 100 for A-shares)
             max_positions: Maximum number of positions
             position_dict: Optional dict to track positions
 
         Returns:
-            List of submitted orders
+            List of actually submitted orders
         """
-        from lumibot.entities import Asset
+        strategy = strategy or self.main_strategy
+        self._is_intercepting = False  # Stop interception
 
+        netted_orders = self.get_netted_orders()
         executed_orders = []
         current_positions = len(position_dict) if position_dict else 0
 
-        for netted in orders:
+        for netted in netted_orders:
             if not netted.should_execute:
                 continue
 
@@ -310,26 +311,28 @@ class PortfolioStrategyHelper:
                 continue
 
             try:
+                from lumibot.entities import Asset
+
                 asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
                 last_price = strategy.get_last_price(asset)
 
                 if last_price is None or last_price <= 0:
+                    logger.warning(f"[OrderInterceptor] Skip {symbol}: no valid price")
                     continue
 
                 # Check position limit for buys
-                if netted.is_buy and current_positions >= max_positions:
-                    logger.info(f"Skip {symbol}: max positions reached")
+                if netted.net_quantity > 0 and current_positions >= max_positions:
+                    logger.info(f"[OrderInterceptor] Skip {symbol}: max positions reached")
                     continue
 
-                # Create and submit order
-                side = "buy" if netted.is_buy else "sell"
-                order = strategy.create_order(asset, quantity, side)
-                strategy.submit_order(order)
-                executed_orders.append(order)
+                # Create and submit order to REAL broker
+                order = strategy.create_order(asset, quantity, netted.side)
+                submitted = strategy.broker.submit_order(order)
+                executed_orders.append(submitted)
 
                 # Update position tracking
                 if position_dict is not None:
-                    if netted.is_buy:
+                    if netted.net_quantity > 0:
                         position_dict[symbol] = {
                             'quantity': quantity,
                             'entry_price': last_price,
@@ -340,37 +343,289 @@ class PortfolioStrategyHelper:
                         position_dict.pop(symbol, None)
                         current_positions -= 1
 
-                # Update portfolio position manager
-                fill_qty = quantity if netted.is_buy else -quantity
-                self.position_manager.update_position(
-                    "portfolio", symbol, fill_qty, last_price
-                )
-
-                logger.info(f"Executed: {side.upper()} {symbol} x {quantity} @ {last_price:.2f}")
+                logger.info(f"[OrderInterceptor] Executed: {netted.side.upper()} "
+                           f"{symbol} x {quantity} @ {last_price:.2f}")
 
             except Exception as e:
-                logger.error(f"Error executing {symbol}: {e}")
+                logger.error(f"[OrderInterceptor] Error executing {symbol}: {e}")
+
+        # Clear accumulated orders
+        self._accumulated_orders.clear()
 
         return executed_orders
 
-    def get_netting_summary(self) -> Dict[str, Any]:
-        """Get a summary of the current netting state."""
-        return {
-            "netting_details": self.netting_engine.get_netting_summary(),
-            "positions": self.position_manager.get_all_positions()
-        }
 
-    def new_iteration(self) -> None:
-        """Start a new iteration (clears previous signals)."""
-        self._iteration_count += 1
-        self.clear_signals()
+def run_strategy_with_interception(strategy_instance: 'Strategy',
+                                    strategy_id: str,
+                                    interceptor: OrderInterceptor):
+    """
+    Run a strategy instance with order interception.
+
+    Temporarily replaces the strategy's broker submit_order method
+    to route orders through the interceptor.
+
+    Args:
+        strategy_instance: The strategy instance to run
+        strategy_id: Unique identifier for this strategy
+        interceptor: The OrderInterceptor to use
+
+    Usage:
+        interceptor = OrderInterceptor(main_strategy)
+
+        # During on_trading_iteration:
+        interceptor.start_interception()
+
+        # Run sub-strategies (orders are intercepted)
+        run_strategy_with_interception(gap_fade_strategy, "gap_fade", interceptor)
+        run_strategy_with_interception(momentum_strategy, "momentum", interceptor)
+
+        # Execute netted orders
+        executed = interceptor.execute_netted_orders(lot_size=100)
+    """
+    # Save original broker's submit_order
+    original_broker = strategy_instance._broker
+    original_submit = original_broker.submit_order
+
+    # Create intercepted submit function
+    def intercepted_submit(order):
+        return interceptor.intercept_order(order, strategy_id)
+
+    # Temporarily replace broker's submit_order
+    strategy_instance._broker.submit_order = intercepted_submit
+
+    try:
+        # Run the strategy's trading iteration
+        # This will call submit_order() which gets intercepted
+        on_trading = getattr(strategy_instance, 'on_trading_iteration', None)
+        if on_trading:
+            on_trading()
+
+    finally:
+        # Restore original broker submit_order
+        strategy_instance._broker = original_broker
+        strategy_instance._broker.submit_order = original_submit
+
+
+class CombinedPortfolioStrategy(Strategy):
+    """
+    Generic portfolio combiner that runs multiple strategies with order netting.
+
+    Strategies and their parameters are passed in via `strategies_config`:
+    [
+        (StrategyClass1, "strategy_id_1", {"param1": value1, ...}),
+        (StrategyClass2, "strategy_id_2", {"param2": value2, ...}),
+        ...
+    ]
+
+    Order Interception:
+    - Each strategy runs independently with its own logic
+    - All submit_order() calls are intercepted
+    - Orders are netted by symbol
+    - Only ONE net order per symbol is executed
+
+    Benefits:
+    - Reusable with any combination of strategies
+    - Exit conditions handled by each strategy
+    - Reduces unnecessary trades via netting
+
+    Usage:
+        from lumibot.strategies.portfolio_strategy import CombinedPortfolioStrategy
+
+        # Define strategies to combine
+        strategies_config = [
+            (PolicyGapRetailReversal, "gap_fade", {
+                "symbols": ["000001.SZ", "600519.SH"],
+                "gap_min": 0.02,
+            }),
+            (InstitutionalFlowDivergence, "momentum", {
+                "symbols": None,
+                "full_data": data_dict,
+                "params": params,
+            }),
+        ]
+
+        # Backtest
+        results = CombinedPortfolioStrategy.backtest(
+            PandasDataBacktesting,
+            start_date,
+            end_date,
+            parameters={
+                "strategies_config": strategies_config,
+                "lot_size": 100,
+                "max_positions": 12,
+            }
+        )
+
+        # Live trading
+        strategy = CombinedPortfolioStrategy(
+            broker=broker,
+            parameters={
+                "strategies_config": strategies_config,
+                "lot_size": 100,
+                "max_positions": 12,
+            }
+        )
+    """
+
+    def initialize(self,
+                   strategies_config: List[Tuple[Type['Strategy'], str, Dict]],
+                   lot_size: int = 100,
+                   max_positions: int = 12):
+        """
+        Initialize the combined portfolio.
+
+        Args:
+            strategies_config: List of (StrategyClass, strategy_id, parameters) tuples
+            lot_size: Lot size for order rounding (default 100 for A-shares)
+            max_positions: Maximum number of positions
+        """
+        from typing import Tuple
+
+        self.sleeptime = "1D"
+        self.lot_size = lot_size
+        self.max_positions = max_positions
+        self.strategies_config = strategies_config
+
+        # Position tracking
+        self.positions_dict = {}
+
+        # Create order interceptor
+        self.interceptor = OrderInterceptor(
+            main_strategy=self,
+            min_net_quantity=lot_size
+        )
+
+        # Create strategy instances
+        self._sub_strategies: Dict[str, 'Strategy'] = {}
+
+        for strategy_class, strategy_id, params in strategies_config:
+            # Create instance without __init__
+            instance = strategy_class.__new__(strategy_class)
+
+            # Set essential attributes from main strategy
+            instance._broker = self._broker
+            instance._data_source = self._data_source
+            instance.datetime = self.datetime if hasattr(self, 'datetime') else None
+
+            # Call strategy's initialize with params
+            init_method = getattr(instance, 'initialize', None)
+            if init_method:
+                # Filter params to only those accepted by initialize
+                import inspect
+                sig = inspect.signature(init_method)
+                valid_params = {
+                    k: v for k, v in params.items()
+                    if k in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in sig.parameters.values()
+                    )
+                }
+                init_method(**valid_params)
+
+            self._sub_strategies[strategy_id] = instance
+
+        self.log_message(f"\n{'='*70}")
+        self.log_message("Combined Portfolio Strategy (Order Interception Mode)")
+        self.log_message(f"{'='*70}")
+        self.log_message(f"Sub-strategies ({len(self._sub_strategies)}):")
+        for sid, inst in self._sub_strategies.items():
+            self.log_message(f"  - {sid}: {inst.__class__.__name__}")
+        self.log_message(f"Order Netting: ENABLED (min_net_quantity={lot_size})")
+        self.log_message(f"Max Positions: {max_positions}")
+        self.log_message(f"{'='*70}")
+
+    def on_trading_iteration(self):
+        """
+        Main trading iteration.
+
+        1. Start order interception
+        2. Run all sub-strategies (orders are intercepted)
+           - Each sub-strategy handles its own exit conditions
+           - Exit orders are also intercepted and netted
+        3. Net orders and execute
+        """
+        current_date = self.get_datetime()
+        logger.info(f"\n{'='*70}")
+        logger.info(f"Trading Iteration: {current_date.strftime('%Y-%m-%d')}")
+        logger.info(f"{'='*70}")
+
+        # Update strategy datetime references
+        for sid, instance in self._sub_strategies.items():
+            instance.datetime = current_date
+
+        # Start intercepting orders
+        self.interceptor.start_interception()
+
+        try:
+            # Run each sub-strategy
+            for strategy_id, instance in self._sub_strategies.items():
+                logger.info(f"--- Running Strategy: {strategy_id} ---")
+                run_strategy_with_interception(
+                    instance,
+                    strategy_id,
+                    self.interceptor
+                )
+
+            # Net and execute orders
+            logger.info("--- Netting & Executing Orders ---")
+            executed = self.interceptor.execute_netted_orders(
+                strategy=self,
+                lot_size=self.lot_size,
+                max_positions=self.max_positions,
+                position_dict=self.positions_dict
+            )
+
+            if executed:
+                logger.info(f"Executed {len(executed)} netted orders")
+            else:
+                logger.info("No orders executed (all netted to zero or below threshold)")
+
+        finally:
+            self.interceptor.stop_interception()
+
+        # Print positions
+        self._print_positions()
+
+        self.await_market_to_close()
+
+    def _print_positions(self):
+        """Print current positions."""
+        if not self.positions_dict:
+            logger.info("Current Positions: None")
+            return
+
+        logger.info(f"Current Positions ({len(self.positions_dict)}):")
+        total_value = 0
+        for symbol, pos in self.positions_dict.items():
+            try:
+                from lumibot.entities import Asset
+                asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
+                current_price = self.get_last_price(asset)
+                if current_price:
+                    value = pos['quantity'] * current_price
+                    pnl = (current_price - pos['entry_price']) / pos['entry_price'] * 100
+                    total_value += value
+                    logger.info(f"  {symbol}: {pos['quantity']} @ {pos['entry_price']:.2f} "
+                          f"(current: {current_price:.2f}, PnL: {pnl:+.1f}%)")
+            except Exception:
+                pass
+
+        logger.info(f"  Total Position Value: {total_value:,.0f}")
+
+    def on_abrupt_closing(self):
+        """Handle abrupt closing."""
+        logger.info(f"{'='*70}")
+        logger.info("Abrupt Closing - Selling All Positions")
+        logger.info(f"{'='*70}")
+        self.sell_all()
+        self.positions_dict.clear()
 
 
 # Convenience exports
 __all__ = [
-    'PortfolioStrategyHelper',
-    'OrderNettingEngine',
-    'PortfolioPositionManager',
-    'TradingSignal',
+    'OrderInterceptor',
+    'run_strategy_with_interception',
+    'CombinedPortfolioStrategy',
+    'AccumulatedOrder',
     'NettedOrder',
 ]
