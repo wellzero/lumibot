@@ -275,10 +275,23 @@ class InstitutionalFlowDivergence(Strategy):
         for symbol in self.symbols:
             if '000300' in symbol or symbol in self.positions_info:
                 continue
-            if symbol not in self.full_data:
-                continue
-            df = self.full_data[symbol]
-            df_before = df[df.index < dt]
+
+            # In backtest mode, use pre-loaded full_data
+            if self.full_data and symbol in self.full_data:
+                df = self.full_data[symbol]
+                df_before = df[df.index < dt]
+            else:
+                # Live mode - fetch historical prices dynamically
+                try:
+                    asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
+                    bars = self.get_historical_prices(asset, 60, timestep="day")
+                    if bars is None or len(bars.df) < 30:
+                        continue
+                    df_before = bars.df
+                except Exception as e:
+                    self.log_message(f"  Error fetching {symbol}: {e}")
+                    continue
+
             if len(df_before) < 30:
                 continue
             score = self._compute_score(symbol, df_before)
@@ -296,8 +309,22 @@ class InstitutionalFlowDivergence(Strategy):
             price = self.get_last_price(symbol)
             if not price or price <= 0:
                 continue
-            df = self.full_data[symbol]
-            df_before = df[df.index < dt]
+
+            # Get historical data for volatility adjustment
+            if self.full_data and symbol in self.full_data:
+                df = self.full_data[symbol]
+                df_before = df[df.index < dt]
+            else:
+                # Live mode - fetch historical prices
+                try:
+                    asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
+                    bars = self.get_historical_prices(asset, 30, timestep="day")
+                    if bars is None:
+                        continue
+                    df_before = bars.df
+                except Exception:
+                    continue
+
             vol_adj = 1.0
             if len(df_before) > 22:
                 c = df_before['close'].values[-22:]
