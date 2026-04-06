@@ -281,8 +281,10 @@ class InstitutionalFlowDivergence(Strategy):
                 df = self.full_data[symbol]
                 # Handle timezone-aware vs tz-naive comparison
                 # dt may be tz-aware (from get_datetime) but df.index is tz-naive
-                dt_cmp = dt.tz_convert(None) if hasattr(dt, 'tz') and dt.tz is not None else dt
-                df_before = df[df.index < dt_cmp]
+                # dt_cmp = dt.tz_convert(None) if hasattr(dt, 'tz') and dt.tz is not None else dt
+                # df_before = df[df.index < dt_cmp]
+                self.logger.info(f"  {symbol}: Using pre-loaded date with {df.index[0]} rows before {dt}")
+                df_before = df[df.index < dt]
             else:
                 # Live mode - fetch historical prices dynamically
                 try:
@@ -525,24 +527,32 @@ if __name__ == "__main__":
         symbols_to_trade = load_symbols_from_selector(end_date=today, top_n=50)
         logging.info(f"Loaded {len(symbols_to_trade)} symbols from selector for live trading")
 
-        # Pre-load historical data for indicators
+        # Pre-load historical data from QMT Bridge for indicators
         lookback_days = 100
         data_loading_start = (datetime.now() - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
         data_loading_end = datetime.now().strftime('%Y-%m-%d')
 
-        logging.info("Loading historical data for live trading...")
-        sys.path.insert(0, '/home/claude/quant_free_strategies')
-        from quant_free.dataset.xq_daily_data import multi_sym_daily_load
+        logging.info("Loading historical data from QMT Bridge for live trading...")
+        from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
 
-        full_data = multi_sym_daily_load(
-            market="cn",
+        # Fetch data from QMT Bridge
+        pandas_data = get_qmt_symbols_historical_price(
             symbols=symbols_to_trade,
             start_date=data_loading_start,
             end_date=data_loading_end,
-            column_option="all",
-            dir_option='xtq'
+            host=qmt_host,
+            port=qmt_port,
+            api_key=qmt_api_key,
+            dividend_type='front'
         )
-        logging.info(f"Loaded historical data for {len(full_data)} symbols")
+
+        # Convert from {Asset: Data} to {symbol: DataFrame} for strategy
+        full_data = {}
+        for asset, data_obj in pandas_data.items():
+            if data_obj and hasattr(data_obj, 'df') and data_obj.df is not None and not data_obj.df.empty:
+                full_data[asset.symbol] = data_obj.df
+
+        logging.info(f"Loaded historical data for {len(full_data)} symbols from QMT Bridge")
 
         strategy_params = {
             "symbols": symbols_to_trade,
@@ -558,7 +568,7 @@ if __name__ == "__main__":
         print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
         print(f"Account ID: {qmt_account_id}")
         print(f"Symbols: {len(symbols_to_trade)} (from selector)")
-        print(f"Historical data: {len(full_data)} symbols")
+        print(f"Historical data: {len(full_data)} symbols (from QMT Bridge)")
         print("=" * 60)
         print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
         print(f"Entry: Score >= 55, vol > 1.3x")
