@@ -168,30 +168,16 @@ class InstitutionalFlowDivergence(Strategy):
         """Update market regime filter using index data available at market open."""
         # In live mode, get historical prices from data source
         # In backtest, use pre-loaded full_data
-        if self.full_data:
-            for sym in self.symbols:
-                if '000300' in sym and sym in self.full_data:
-                    df = self.full_data[sym]
-                    df_before = df[df.index < dt]
-                    if len(df_before) > 22:
-                        closes = df_before['close'].values[-21:-1]
-                        if len(closes) >= 20:
-                            yesterday_close = df_before['close'].values[-1]
-                            ma20 = np.mean(closes[-20:])
-                            self.index_above_ma = yesterday_close > ma20
-                    return
-        else:
-            # Live mode - try to get index data
-            try:
-                index_asset = Asset(symbol="000300.SH", asset_type=Asset.AssetType.STOCK)
-                bars = self.get_historical_prices(index_asset, 30, timestep="day")
-                if bars and len(bars.df) >= 20:
-                    closes = bars.df['close'].values
-                    yesterday_close = closes[-1]
-                    ma20 = np.mean(closes[-20:])
-                    self.index_above_ma = yesterday_close > ma20
-            except Exception:
-                pass
+        index_asset = Asset(symbol="SH000300", asset_type=Asset.AssetType.STOCK)
+        bars = self.get_historical_prices(index_asset, 30, timestep="day", timeshift=1)
+        df_before = bars.df if bars is not None else None
+        if len(df_before) > 22:
+            closes = df_before['close'].values[-21:-1]
+            if len(closes) >= 20:
+                yesterday_close = df_before['close'].values[-1]
+                ma20 = np.mean(closes[-20:])
+                self.index_above_ma = yesterday_close > ma20
+        return
 
     def _compute_score(self, symbol, df_before):
         """Compute entry score using only data available before market open."""
@@ -276,26 +262,16 @@ class InstitutionalFlowDivergence(Strategy):
             if '000300' in symbol or symbol in self.positions_info:
                 continue
 
-            # In backtest mode, use pre-loaded full_data
-            if self.full_data and symbol in self.full_data:
-                df = self.full_data[symbol]
-                # Handle timezone-aware vs tz-naive comparison
-                # dt may be tz-aware (from get_datetime) but df.index is tz-naive
-                # dt_cmp = dt.tz_convert(None) if hasattr(dt, 'tz') and dt.tz is not None else dt
-                # df_before = df[df.index < dt_cmp]
-                self.logger.info(f"  {symbol}: Using pre-loaded date with {df.index[0]} rows before {dt}")
-                df_before = df[df.index < dt]
-            else:
-                # Live mode - fetch historical prices dynamically
-                try:
-                    asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
-                    bars = self.get_historical_prices(asset, 60, timestep="day")
-                    if bars is None or len(bars.df) < 30:
-                        continue
-                    df_before = bars.df
-                except Exception as e:
-                    self.log_message(f"  Error fetching {symbol}: {e}")
+            # In backtest mode, use pre-loaded full_data with time filter
+            try:
+                asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
+                bars = self.get_historical_prices(asset, 60, timestep="day", timeshift=1)
+                if bars is None or len(bars.df) < 30:
                     continue
+                df_before = bars.df
+            except Exception as e:
+                self.log_message(f"  Error fetching {symbol}: {e}")
+                continue
 
             if len(df_before) < 30:
                 continue
@@ -316,21 +292,14 @@ class InstitutionalFlowDivergence(Strategy):
                 continue
 
             # Get historical data for volatility adjustment
-            if self.full_data and symbol in self.full_data:
-                df = self.full_data[symbol]
-                # Handle timezone-aware vs tz-naive comparison
-                dt_cmp = dt.tz_convert(None) if hasattr(dt, 'tz') and dt.tz is not None else dt
-                df_before = df[df.index < dt_cmp]
-            else:
-                # Live mode - fetch historical prices
-                try:
-                    asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
-                    bars = self.get_historical_prices(asset, 30, timestep="day")
-                    if bars is None:
-                        continue
-                    df_before = bars.df
-                except Exception:
+            try:
+                asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
+                bars = self.get_historical_prices(asset, 30, timestep="day", timeshift=1)
+                if bars is None:
                     continue
+                df_before = bars.df
+            except Exception:
+                continue
 
             vol_adj = 1.0
             if len(df_before) > 22:
@@ -435,7 +404,7 @@ if __name__ == "__main__":
         logging.info(f"Loaded {len(symbols_to_trade)} symbols from selector")
 
         # Add index symbol for regime filter
-        index_symbol = "000300.SH"
+        index_symbol = "SH000300"
         all_symbols = symbols_to_trade + [index_symbol]
 
         # Load data with lookback period for indicators (same method as reference)
@@ -536,6 +505,7 @@ if __name__ == "__main__":
         from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
 
         # Fetch data from QMT Bridge
+        symbols_to_trade = symbols_to_trade + ["SH000300"]  # Ensure index is included for regime filter
         pandas_data = get_qmt_symbols_historical_price(
             symbols=symbols_to_trade,
             start_date=data_loading_start,
