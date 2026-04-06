@@ -360,7 +360,7 @@ class InstitutionalFlowDivergence(Strategy):
 
 def load_symbols_from_selector(end_date: str, top_n: int = 50) -> list:
     """Load symbols from selector if available, otherwise use defaults."""
-    selector_path = os.path.join(os.path.dirname(__file__), '..', 'screen', 'csi300_institutional_flow_divergence_selector.py')
+    selector_path = os.path.join(os.path.dirname(__file__), '..', 'csi300_institutional_flow_divergence_selector.py')
     if os.path.exists(selector_path):
         import importlib.util
         spec = importlib.util.spec_from_file_location("selector", selector_path)
@@ -380,16 +380,37 @@ if __name__ == "__main__":
 
     # ── Backtest mode ───────────────────────────────────────────────────────
     if IS_BACKTESTING:
-        backtesting_start_date = '2022-01-01'
-        backtesting_end_date = '2024-12-31'
+        backtesting_start_date = '2025-01-01'
+        backtesting_end_date = '2026-01-31'
 
         # Load symbols from selector for backtest
         symbols_to_trade = load_symbols_from_selector(end_date=backtesting_start_date, top_n=50)
         logging.info(f"Loaded {len(symbols_to_trade)} symbols from selector")
 
+        # Add index symbol for regime filter
+        index_symbol = "000300.SH"
+        all_symbols = symbols_to_trade + [index_symbol]
+
+        # Load data with lookback period for indicators
+        lookback_days = 100
+        data_loading_start = (pd.to_datetime(backtesting_start_date) - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+
+        logging.info("Loading historical data from QMT Bridge...")
+        from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
+        full_data = get_qmt_symbols_historical_price(
+            symbols=all_symbols,
+            start_date=data_loading_start,
+            end_date=backtesting_end_date,
+            host=qmt_host,
+            port=qmt_port,
+            api_key=qmt_api_key,
+            dividend_type='front'
+        )
+        logging.info(f"Loaded data for {len(full_data)} symbols")
+
         strategy_params = {
-            "symbols": symbols_to_trade,
-            "full_data": {},
+            "symbols": all_symbols,
+            "full_data": full_data,
             "params": StrategyParams(),
         }
 
@@ -408,7 +429,7 @@ if __name__ == "__main__":
         print(f"QMT Bridge Host: {qmt_host}")
         print(f"QMT Bridge Port: {qmt_port}")
         print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
-        print(f"Symbols: {len(symbols_to_trade)}")
+        print(f"Symbols: {len(all_symbols)} (including index {index_symbol})")
         print(f"Backtest period: {backtesting_start_date} to {backtesting_end_date}")
         print("=" * 60)
         print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
@@ -428,7 +449,7 @@ if __name__ == "__main__":
                 "host": qmt_host,
                 "port": qmt_port,
                 "api_key": qmt_api_key,
-                "symbols": symbols_to_trade,
+                "symbols": all_symbols,
                 "dividend_type": "front"
             },
             parameters=strategy_params,
