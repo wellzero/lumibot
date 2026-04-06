@@ -192,6 +192,31 @@ class QMTBridgeData(DataSource):
                 ) from e
         return self._client
 
+    def get_datetime(self, adjust_for_delay=False):
+        """Get the current datetime in the Shanghai timezone.
+
+        This override ensures the datetime is timezone-aware for Chinese markets.
+
+        Parameters
+        ----------
+        adjust_for_delay : bool, optional
+            Whether to adjust for data delay, by default False.
+
+        Returns
+        -------
+        datetime
+            Current datetime in Asia/Shanghai timezone (tz-aware).
+        """
+        from datetime import datetime
+
+        # Get current time and make it timezone-aware in Asia/Shanghai
+        now = datetime.now(self.tzinfo)
+
+        if adjust_for_delay and self._delay:
+            now -= self._delay
+
+        return now
+
     def _convert_timestep_to_qmt(self, timestep: str) -> str:
         """Convert LumiBot timestep to QMT period string.
 
