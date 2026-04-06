@@ -168,14 +168,30 @@ class QMTBridgeBroker(Broker):
         Returns
         -------
         str
-            Symbol in QMT format.
+            Symbol in QMT format (e.g., "600519.SH", "000001.SZ").
+
+        Supported Input Formats:
+            - "600519" or "SH600519" → "600519.SH"
+            - "000001" or "SZ000001" → "000001.SZ"
+            - "600519.SH" → "600519.SH" (already normalized)
         """
         symbol = asset.symbol.upper()
 
+        # Already in exchange.suffix format
         if "." in symbol:
             return symbol
 
-        # Determine exchange based on stock code
+        # Handle SHxxxxxx → xxxxxx.SH format
+        if symbol.startswith("SH") and len(symbol) > 2:
+            code = symbol[2:]
+            return f"{code}.SH"
+
+        # Handle SZxxxxxx → xxxxxx.SZ format
+        if symbol.startswith("SZ") and len(symbol) > 2:
+            code = symbol[2:]
+            return f"{code}.SZ"
+
+        # Handle xxxxxx format (determine exchange by code prefix)
         if symbol.startswith("6"):
             return f"{symbol}.SH"
         elif symbol.startswith(("0", "3")):
