@@ -752,8 +752,9 @@ def get_qmt_symbols_historical_price(
             try:
                 asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
 
-                if symbol in result and result[symbol] is not None and not result[symbol].empty:
-                    df = result[qmt_bridge_normalize_symbol(symbol)]
+                qmt_symbol = qmt_bridge_normalize_symbol(symbol)
+                if qmt_symbol in result and result[qmt_symbol] is not None and not result[qmt_symbol].empty:
+                    df = result[qmt_symbol]
 
                     if "time" in df.columns:
                         df = df.copy()

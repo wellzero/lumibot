@@ -48,6 +48,8 @@ from lumibot.entities import Asset, Data
 from lumibot.backtesting import QMTBridgeDataBacktesting
 from lumibot.credentials import IS_BACKTESTING
 
+from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
+
 import matplotlib
 matplotlib.rcParams['font.family'] = 'DejaVu Sans'
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
@@ -171,7 +173,7 @@ class InstitutionalFlowDivergence(Strategy):
         index_asset = Asset(symbol="SH000300", asset_type=Asset.AssetType.STOCK)
         bars = self.get_historical_prices(index_asset, 30, timestep="day", timeshift=1)
         df_before = bars.df if bars is not None else None
-        if len(df_before) > 22:
+        if df_before is not None and len(df_before) > 22:
             closes = df_before['close'].values[-21:-1]
             if len(closes) >= 20:
                 yesterday_close = df_before['close'].values[-1]
@@ -407,29 +409,43 @@ if __name__ == "__main__":
         index_symbol = "SH000300"
         all_symbols = symbols_to_trade + [index_symbol]
 
-        # Load data with lookback period for indicators (same method as reference)
+        # Load data with lookback period for indicators
         lookback_days = 100
         data_loading_start = (pd.to_datetime(backtesting_start_date) - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
 
-        logging.info("Loading historical data from local storage...")
-        sys.path.insert(0, '/home/claude/quant_free_strategies')
-        from quant_free.dataset.xq_daily_data import multi_sym_daily_load
-        full_data = multi_sym_daily_load(
-            market="cn",
-            symbols=all_symbols,
-            start_date=data_loading_start,
-            end_date=backtesting_end_date,
-            column_option="all",
-            dir_option='xtq'
-        )
-        logging.info(f"Loaded data for {len(full_data)} symbols")
+        # Use QMT Bridge for online data
+        logging.info("Loading historical data from QMT Bridge...")
+        from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
 
-        # Convert to pandas_data format for backtesting
+        # pandas_data = get_qmt_symbols_historical_price(
+        #     symbols=all_symbols,
+        #     start_date=data_loading_start,
+        #     end_date=backtesting_end_date,
+        #     host=qmt_host,
+        #     port=qmt_port,
+        #     api_key=qmt_api_key,
+        #     dividend_type='front'
+        # )
+
+        # # Convert pandas_data to full_data dict for strategy
+        # full_data = {}
+        # for asset, data_obj in pandas_data.items():
+        #     if data_obj and hasattr(data_obj, 'df') and data_obj.df is not None and not data_obj.df.empty:
+        #         logging.info(f"Loaded data for {asset.symbol} with {len(data_obj.df)} rows")
+        #         full_data[asset.symbol] = data_obj.df
+
+        from quant_free.dataset.xq_daily_data import multi_sym_daily_load
+        full_data = multi_sym_daily_load(market="cn", symbols=all_symbols, 
+                                         start_date=data_loading_start, 
+                                         end_date=backtesting_end_date, 
+                                         column_option="all", dir_option='xtq')
         pandas_data = {}
-        for sym, df in full_data.items():
-            if not df.empty:
+        usd_quote = Asset(symbol="USD", asset_type="forex")
+        for sym in all_symbols:
+            if sym in full_data and not full_data[sym].empty:
                 asset = Asset(symbol=sym, asset_type=Asset.AssetType.STOCK)
-                pandas_data[asset] = Data(asset=asset, df=df, timestep="day")
+                pandas_data[asset] = Data(asset=asset, df=full_data[sym], timestep="day", quote=usd_quote)
+        logging.info(f"Loaded data for {len(full_data)} symbols from QMT Bridge")
 
         strategy_params = {
             "symbols": all_symbols,
@@ -502,7 +518,6 @@ if __name__ == "__main__":
         data_loading_end = datetime.now().strftime('%Y-%m-%d')
 
         logging.info("Loading historical data from QMT Bridge for live trading...")
-        from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
 
         # Fetch data from QMT Bridge
         symbols_to_trade = symbols_to_trade + ["SH000300"]  # Ensure index is included for regime filter
