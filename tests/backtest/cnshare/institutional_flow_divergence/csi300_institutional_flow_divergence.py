@@ -515,12 +515,33 @@ if __name__ == "__main__":
             print("ERROR: QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
             sys.exit(1)
 
-        # Use default stocks for live trading
-        symbols_to_trade = DEFAULT_STOCKS
+        # Load symbols from selector for live trading
+        today = datetime.now().strftime('%Y-%m-%d')
+        symbols_to_trade = load_symbols_from_selector(end_date=today, top_n=50)
+        logging.info(f"Loaded {len(symbols_to_trade)} symbols from selector for live trading")
+
+        # Pre-load historical data for indicators
+        lookback_days = 100
+        data_loading_start = (datetime.now() - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+        data_loading_end = datetime.now().strftime('%Y-%m-%d')
+
+        logging.info("Loading historical data for live trading...")
+        sys.path.insert(0, '/home/claude/quant_free_strategies')
+        from quant_free.dataset.xq_daily_data import multi_sym_daily_load
+
+        full_data = multi_sym_daily_load(
+            market="cn",
+            symbols=symbols_to_trade,
+            start_date=data_loading_start,
+            end_date=data_loading_end,
+            column_option="all",
+            dir_option='xtq'
+        )
+        logging.info(f"Loaded historical data for {len(full_data)} symbols")
 
         strategy_params = {
             "symbols": symbols_to_trade,
-            "full_data": {},
+            "full_data": full_data,
             "params": StrategyParams(),
         }
 
@@ -531,7 +552,8 @@ if __name__ == "__main__":
         print(f"QMT Bridge Port: {qmt_port}")
         print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
         print(f"Account ID: {qmt_account_id}")
-        print(f"Symbols: {len(symbols_to_trade)}")
+        print(f"Symbols: {len(symbols_to_trade)} (from selector)")
+        print(f"Historical data: {len(full_data)} symbols")
         print("=" * 60)
         print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
         print(f"Entry: Score >= 55, vol > 1.3x")

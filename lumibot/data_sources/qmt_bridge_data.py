@@ -238,6 +238,16 @@ class QMTBridgeData(DataSource):
         if "." in symbol:
             return symbol
 
+        # Handle SHxxxxxx → xxxxxx.SH format
+        if symbol.startswith("SH") and len(symbol) > 2:
+            code = symbol[2:]
+            return f"{code}.SH"
+
+        # Handle SZxxxxxx → xxxxxx.SZ format
+        if symbol.startswith("SZ") and len(symbol) > 2:
+            code = symbol[2:]
+            return f"{code}.SZ"
+
         # Determine exchange based on stock code
         if symbol.startswith("6"):
             # Shanghai Stock Exchange stocks start with 6
