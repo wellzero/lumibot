@@ -33,6 +33,31 @@ from lumibot.tools.lumibot_logger import get_logger
 
 logger = get_logger(__name__)
 
+def qmt_bridge_normalize_symbol(symbol: str) -> str:
+    # Handle SHxxxxxx → xxxxxx.SH format
+    if symbol.startswith("SH") and len(symbol) > 2:
+        code = symbol[2:]
+        return f"{code}.SH"
+
+    # Handle SZxxxxxx → xxxxxx.SZ format
+    if symbol.startswith("SZ") and len(symbol) > 2:
+        code = symbol[2:]
+        return f"{code}.SZ"
+
+    # Determine exchange based on stock code
+    if symbol.startswith("6"):
+        # Shanghai Stock Exchange stocks start with 6
+        return f"{symbol}.SH"
+    elif symbol.startswith(("0", "3")):
+        # Shenzhen Stock Exchange: 0xxx (main board), 3xxx (ChiNext)
+        return f"{symbol}.SZ"
+    elif symbol.startswith("68"):
+        # Shanghai STAR Market
+        return f"{symbol}.SH"
+    else:
+        # Default to Shenzhen
+        return f"{symbol}.SZ"
+
 # QMT Bridge timestep mapping
 # Maps LumiBot timestep names to QMT period strings
 QMT_TIMESTEP_MAPPING = [
@@ -262,30 +287,8 @@ class QMTBridgeData(DataSource):
         # If symbol already has exchange suffix, return as-is
         if "." in symbol:
             return symbol
-
-        # Handle SHxxxxxx → xxxxxx.SH format
-        if symbol.startswith("SH") and len(symbol) > 2:
-            code = symbol[2:]
-            return f"{code}.SH"
-
-        # Handle SZxxxxxx → xxxxxx.SZ format
-        if symbol.startswith("SZ") and len(symbol) > 2:
-            code = symbol[2:]
-            return f"{code}.SZ"
-
-        # Determine exchange based on stock code
-        if symbol.startswith("6"):
-            # Shanghai Stock Exchange stocks start with 6
-            return f"{symbol}.SH"
-        elif symbol.startswith(("0", "3")):
-            # Shenzhen Stock Exchange: 0xxx (main board), 3xxx (ChiNext)
-            return f"{symbol}.SZ"
-        elif symbol.startswith("68"):
-            # Shanghai STAR Market
-            return f"{symbol}.SH"
-        else:
-            # Default to Shenzhen
-            return f"{symbol}.SZ"
+        
+        return qmt_bridge_normalize_symbol(symbol)
 
     def get_chains(self, asset: Asset, quote: Asset = None) -> dict:
         """Get option chain information for an asset.
@@ -712,6 +715,7 @@ def get_qmt_symbols_historical_price(
     try:
         # Step 1: Download data to local storage in batches
         total_symbols = len(symbols)
+        batch_api = [qmt_bridge_normalize_symbol(s) for s in symbols]
         batch_size = 10
         logger.info("Downloading data in batches of %d...", batch_size)
 
@@ -722,13 +726,7 @@ def get_qmt_symbols_historical_price(
             logger.info("  Downloading batch %d/%d (%d symbols)...", batch_num, total_batches, len(batch))
 
             # Convert symbols to QMT format: SZ000001 → 000001.SZ, SH600519 → 600519.SH
-            def to_qmt_format(sym: str) -> str:
-                if sym.startswith("SZ"):
-                    return f"{sym[2:]}.SZ"
-                elif sym.startswith("SH"):
-                    return f"{sym[2:]}.SH"
-                return sym  # Already in correct format (e.g., "000001.SZ")
-            batch_api = [to_qmt_format(s) for s in batch]
+            batch_api = [qmt_bridge_normalize_symbol(s) for s in batch]
             try:
                 client.download_batch(
                     stocks=batch_api,
@@ -741,8 +739,9 @@ def get_qmt_symbols_historical_price(
 
         # Step 2: Load data from local storage
         logger.info("Loading historical data from local storage...")
+        symbols_qmt = [qmt_bridge_normalize_symbol(s) for s in symbols]
         result = client.get_local_data(
-            stocks=symbols,
+            stocks=symbols_qmt,
             period="1d",
             start_time=fetch_start,
             end_time=fetch_end,
@@ -754,7 +753,7 @@ def get_qmt_symbols_historical_price(
                 asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
 
                 if symbol in result and result[symbol] is not None and not result[symbol].empty:
-                    df = result[symbol]
+                    df = result[qmt_bridge_normalize_symbol(symbol)]
 
                     if "time" in df.columns:
                         df = df.copy()

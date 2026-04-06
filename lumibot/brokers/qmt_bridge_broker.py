@@ -35,6 +35,7 @@ from typing import Union
 from lumibot.brokers.broker import Broker
 from lumibot.entities import Asset, Order, Position
 from lumibot.tools.lumibot_logger import get_logger
+from lumibot.data_sources.qmt_bridge_data import qmt_bridge_normalize_symbol
 
 logger = get_logger(__name__)
 
@@ -181,25 +182,7 @@ class QMTBridgeBroker(Broker):
         if "." in symbol:
             return symbol
 
-        # Handle SHxxxxxx → xxxxxx.SH format
-        if symbol.startswith("SH") and len(symbol) > 2:
-            code = symbol[2:]
-            return f"{code}.SH"
-
-        # Handle SZxxxxxx → xxxxxx.SZ format
-        if symbol.startswith("SZ") and len(symbol) > 2:
-            code = symbol[2:]
-            return f"{code}.SZ"
-
-        # Handle xxxxxx format (determine exchange by code prefix)
-        if symbol.startswith("6"):
-            return f"{symbol}.SH"
-        elif symbol.startswith(("0", "3")):
-            return f"{symbol}.SZ"
-        elif symbol.startswith("68"):
-            return f"{symbol}.SH"
-        else:
-            return f"{symbol}.SZ"
+        return qmt_bridge_normalize_symbol(symbol)
 
     # ==================== Order Methods ====================
 
