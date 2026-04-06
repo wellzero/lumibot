@@ -461,6 +461,7 @@ if __name__ == "__main__":
             pd.to_datetime(backtesting_end_date),
             benchmark_asset="000001.SS",
             pandas_data=pandas_data,
+            budget=10000,  # Match reference implementation
             sleeptime="1D",
             logfile=f"{base_filename}_log.txt",
             stats_file=f"{base_filename}_stats.csv",
