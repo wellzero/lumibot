@@ -279,7 +279,10 @@ class InstitutionalFlowDivergence(Strategy):
             # In backtest mode, use pre-loaded full_data
             if self.full_data and symbol in self.full_data:
                 df = self.full_data[symbol]
-                df_before = df[df.index < dt]
+                # Handle timezone-aware vs tz-naive comparison
+                # dt may be tz-aware (from get_datetime) but df.index is tz-naive
+                dt_cmp = dt.tz_convert(None) if hasattr(dt, 'tz') and dt.tz is not None else dt
+                df_before = df[df.index < dt_cmp]
             else:
                 # Live mode - fetch historical prices dynamically
                 try:
@@ -313,7 +316,9 @@ class InstitutionalFlowDivergence(Strategy):
             # Get historical data for volatility adjustment
             if self.full_data and symbol in self.full_data:
                 df = self.full_data[symbol]
-                df_before = df[df.index < dt]
+                # Handle timezone-aware vs tz-naive comparison
+                dt_cmp = dt.tz_convert(None) if hasattr(dt, 'tz') and dt.tz is not None else dt
+                df_before = df[df.index < dt_cmp]
             else:
                 # Live mode - fetch historical prices
                 try:
