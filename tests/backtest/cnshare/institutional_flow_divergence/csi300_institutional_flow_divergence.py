@@ -378,7 +378,7 @@ if __name__ == "__main__":
         backtesting_end_date = '2024-12-31'
 
         test_date = datetime.now().strftime('%Y-%m-%d')
-        quant_data_dir = "/home/quant_volumn/quant_data"
+        quant_data_dir = os.getenv("QUANT_DATA_DIR", "/home/quant_volumn/quant_data")
         execution_folder_path = f"{quant_data_dir}/html/backtest/{test_date}/{STRATEGY_NAME}"
         Path(execution_folder_path).mkdir(parents=True, exist_ok=True)
         html_link = f"{os.getenv('RESULT_LINK', '')}/backtest/{test_date}/{STRATEGY_NAME}"

@@ -184,7 +184,7 @@ def run_backtest(strategies_config: List, lot_size: int = 100, max_positions: in
     data_loading_start_str = data_loading_start.strftime('%Y-%m-%d')
 
     test_date = datetime.now().strftime('%Y-%m-%d')
-    quant_data_dir = "/home/quant_volumn/quant_data"
+    quant_data_dir = os.getenv("QUANT_DATA_DIR", "/home/quant_volumn/quant_data")
     execution_folder_path = f"{quant_data_dir}/html/backtest/{test_date}/combined_portfolio"
     Path(execution_folder_path).mkdir(parents=True, exist_ok=True)
 
