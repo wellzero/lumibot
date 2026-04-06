@@ -143,6 +143,8 @@ class InstitutionalFlowDivergence(Strategy):
 
     def on_trading_iteration(self):
         dt = self.get_datetime()
+        self.log_message(f"\n=== Trading iteration for {dt.strftime('%Y-%m-%d')} ===")
+        # logging.info(f"\n=== Trading iteration for {dt.strftime('%Y-%m-%d')} ===")
         if self.last_date != dt:
             self.new_entries_today = 0
             self.last_date = dt
@@ -173,6 +175,8 @@ class InstitutionalFlowDivergence(Strategy):
         index_asset = Asset(symbol="SH000300", asset_type=Asset.AssetType.STOCK)
         bars = self.get_historical_prices(index_asset, 30, timestep="day", timeshift=1)
         df_before = bars.df if bars is not None else None
+        self.log_message("Regime check for index SH000300: Data points available = {}"\
+                     .format(df_before.tail(5) if df_before is not None else 0))
         if df_before is not None and len(df_before) > 22:
             closes = df_before['close'].values[-21:-1]
             if len(closes) >= 20:
@@ -415,41 +419,27 @@ if __name__ == "__main__":
 
         # Use QMT Bridge for online data
         logging.info("Loading historical data from QMT Bridge...")
+        
         from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
+        pandas_data = get_qmt_symbols_historical_price(
+            symbols=all_symbols,
+            start_date=data_loading_start,
+            end_date=backtesting_end_date,
+            host=qmt_host,
+            port=qmt_port,
+            api_key=qmt_api_key,
+            dividend_type='front'
+        )
 
-        # pandas_data = get_qmt_symbols_historical_price(
-        #     symbols=all_symbols,
-        #     start_date=data_loading_start,
-        #     end_date=backtesting_end_date,
-        #     host=qmt_host,
-        #     port=qmt_port,
-        #     api_key=qmt_api_key,
-        #     dividend_type='front'
-        # )
+        # from quant_free.dataset.xq_daily_data import multi_sym_daily_load_for_lumibot
+        # pandas_data = multi_sym_daily_load_for_lumibot(market="cn", symbols=all_symbols, 
+        #                                  start_date=data_loading_start, 
+        #                                  end_date=backtesting_end_date, 
+        #                                  column_option="all", dir_option='xtq')
 
-        # # Convert pandas_data to full_data dict for strategy
-        # full_data = {}
-        # for asset, data_obj in pandas_data.items():
-        #     if data_obj and hasattr(data_obj, 'df') and data_obj.df is not None and not data_obj.df.empty:
-        #         logging.info(f"Loaded data for {asset.symbol} with {len(data_obj.df)} rows")
-        #         full_data[asset.symbol] = data_obj.df
-
-        from quant_free.dataset.xq_daily_data import multi_sym_daily_load
-        full_data = multi_sym_daily_load(market="cn", symbols=all_symbols, 
-                                         start_date=data_loading_start, 
-                                         end_date=backtesting_end_date, 
-                                         column_option="all", dir_option='xtq')
-        pandas_data = {}
-        usd_quote = Asset(symbol="USD", asset_type="forex")
-        for sym in all_symbols:
-            if sym in full_data and not full_data[sym].empty:
-                asset = Asset(symbol=sym, asset_type=Asset.AssetType.STOCK)
-                pandas_data[asset] = Data(asset=asset, df=full_data[sym], timestep="day", quote=usd_quote)
-        logging.info(f"Loaded data for {len(full_data)} symbols from QMT Bridge")
 
         strategy_params = {
             "symbols": all_symbols,
-            "full_data": full_data,
             "params": StrategyParams(),
         }
 
@@ -531,17 +521,8 @@ if __name__ == "__main__":
             dividend_type='front'
         )
 
-        # Convert from {Asset: Data} to {symbol: DataFrame} for strategy
-        full_data = {}
-        for asset, data_obj in pandas_data.items():
-            if data_obj and hasattr(data_obj, 'df') and data_obj.df is not None and not data_obj.df.empty:
-                full_data[asset.symbol] = data_obj.df
-
-        logging.info(f"Loaded historical data for {len(full_data)} symbols from QMT Bridge")
-
         strategy_params = {
             "symbols": symbols_to_trade,
-            "full_data": full_data,
             "params": StrategyParams(),
         }
 
@@ -553,7 +534,6 @@ if __name__ == "__main__":
         print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
         print(f"Account ID: {qmt_account_id}")
         print(f"Symbols: {len(symbols_to_trade)} (from selector)")
-        print(f"Historical data: {len(full_data)} symbols (from QMT Bridge)")
         print("=" * 60)
         print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
         print(f"Entry: Score >= 55, vol > 1.3x")
