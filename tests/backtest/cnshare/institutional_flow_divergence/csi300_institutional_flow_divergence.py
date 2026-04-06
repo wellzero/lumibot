@@ -360,14 +360,27 @@ class InstitutionalFlowDivergence(Strategy):
 
 def load_symbols_from_selector(end_date: str, top_n: int = 50) -> list:
     """Load symbols from selector if available, otherwise use defaults."""
-    selector_path = os.path.join(os.path.dirname(__file__), '..', 'csi300_institutional_flow_divergence_selector.py')
-    if os.path.exists(selector_path):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("selector", selector_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        symbols, _ = mod.select_stocks(top_n=top_n, end_date=end_date)
-        return symbols
+    # Try multiple selector paths
+    selector_paths = [
+        # Try same directory first
+        os.path.join(os.path.dirname(__file__), 'csi300_institutional_flow_divergence_selector.py'),
+        # Try parent directory
+        os.path.join(os.path.dirname(__file__), '..', 'csi300_institutional_flow_divergence_selector.py'),
+        # Try quant_free_strategies location
+        '/home/claude/quant_free_strategies/cn_strategies/csi300_institutional_flow_divergence/screen/csi300_institutional_flow_divergence_selector.py',
+    ]
+
+    for selector_path in selector_paths:
+        if os.path.exists(selector_path):
+            logging.info(f"Loading symbols from selector: {selector_path}")
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("selector", selector_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            symbols, _ = mod.select_stocks(top_n=top_n, end_date=end_date)
+            return symbols
+
+    logging.warning(f"Selector not found, using DEFAULT_STOCKS")
     return DEFAULT_STOCKS
 
 
@@ -391,22 +404,29 @@ if __name__ == "__main__":
         index_symbol = "000300.SH"
         all_symbols = symbols_to_trade + [index_symbol]
 
-        # Load data with lookback period for indicators
+        # Load data with lookback period for indicators (same method as reference)
         lookback_days = 100
         data_loading_start = (pd.to_datetime(backtesting_start_date) - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
 
-        logging.info("Loading historical data from QMT Bridge...")
-        from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
-        full_data = get_qmt_symbols_historical_price(
+        logging.info("Loading historical data from local storage...")
+        sys.path.insert(0, '/home/claude/quant_free_strategies')
+        from quant_free.dataset.xq_daily_data import multi_sym_daily_load
+        full_data = multi_sym_daily_load(
+            market="cn",
             symbols=all_symbols,
             start_date=data_loading_start,
             end_date=backtesting_end_date,
-            host=qmt_host,
-            port=qmt_port,
-            api_key=qmt_api_key,
-            dividend_type='front'
+            column_option="all",
+            dir_option='xtq'
         )
         logging.info(f"Loaded data for {len(full_data)} symbols")
+
+        # Convert to pandas_data format for backtesting
+        pandas_data = {}
+        for sym, df in full_data.items():
+            if not df.empty:
+                asset = Asset(symbol=sym, asset_type=Asset.AssetType.STOCK)
+                pandas_data[asset] = Data(asset=asset, df=df, timestep="day")
 
         strategy_params = {
             "symbols": all_symbols,
@@ -426,9 +446,6 @@ if __name__ == "__main__":
         print("=" * 60)
         print("QMT Bridge Backtest Configuration")
         print("=" * 60)
-        print(f"QMT Bridge Host: {qmt_host}")
-        print(f"QMT Bridge Port: {qmt_port}")
-        print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
         print(f"Symbols: {len(all_symbols)} (including index {index_symbol})")
         print(f"Backtest period: {backtesting_start_date} to {backtesting_end_date}")
         print("=" * 60)
@@ -437,21 +454,16 @@ if __name__ == "__main__":
         print(f"Exit: 20% profit / 4% stop / 8-day max hold")
         print("=" * 60)
 
+        from lumibot.backtesting import PandasDataBacktesting
         results = InstitutionalFlowDivergence.backtest(
-            QMTBridgeDataBacktesting,
+            PandasDataBacktesting,
             pd.to_datetime(backtesting_start_date),
             pd.to_datetime(backtesting_end_date),
             benchmark_asset="000001.SS",
+            pandas_data=pandas_data,
             sleeptime="1D",
             logfile=f"{base_filename}_log.txt",
             stats_file=f"{base_filename}_stats.csv",
-            config={
-                "host": qmt_host,
-                "port": qmt_port,
-                "api_key": qmt_api_key,
-                "symbols": all_symbols,
-                "dividend_type": "front"
-            },
             parameters=strategy_params,
         )
 
