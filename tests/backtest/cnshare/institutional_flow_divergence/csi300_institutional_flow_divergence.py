@@ -358,24 +358,40 @@ class InstitutionalFlowDivergence(Strategy):
         self.log_message(f"\n=== {STRATEGY_NAME} v{STRATEGY_VERSION} Stats: Buys={self.total_buys}, Sells={self.total_sells} ===")
 
 
+def load_symbols_from_selector(end_date: str, top_n: int = 50) -> list:
+    """Load symbols from selector if available, otherwise use defaults."""
+    selector_path = os.path.join(os.path.dirname(__file__), '..', 'screen', 'csi300_institutional_flow_divergence_selector.py')
+    if os.path.exists(selector_path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("selector", selector_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        symbols, _ = mod.select_stocks(top_n=top_n, end_date=end_date)
+        return symbols
+    return DEFAULT_STOCKS
+
+
 if __name__ == "__main__":
     # ── Common config ───────────────────────────────────────────────────────
     qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
     qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
     qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
     qmt_account_id = os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
-    symbols_to_trade = DEFAULT_STOCKS
-
-    strategy_params = {
-        "symbols": symbols_to_trade,
-        "full_data": {},  # Will be populated in backtest mode
-        "params": StrategyParams(),
-    }
 
     # ── Backtest mode ───────────────────────────────────────────────────────
     if IS_BACKTESTING:
         backtesting_start_date = '2022-01-01'
         backtesting_end_date = '2024-12-31'
+
+        # Load symbols from selector for backtest
+        symbols_to_trade = load_symbols_from_selector(end_date=backtesting_start_date, top_n=50)
+        logging.info(f"Loaded {len(symbols_to_trade)} symbols from selector")
+
+        strategy_params = {
+            "symbols": symbols_to_trade,
+            "full_data": {},
+            "params": StrategyParams(),
+        }
 
         test_date = datetime.now().strftime('%Y-%m-%d')
         quant_data_dir = os.getenv("QUANT_DATA_DIR", "/home/quant_volumn/quant_data")
@@ -437,6 +453,15 @@ if __name__ == "__main__":
         if not qmt_account_id:
             print("ERROR: QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
             sys.exit(1)
+
+        # Use default stocks for live trading
+        symbols_to_trade = DEFAULT_STOCKS
+
+        strategy_params = {
+            "symbols": symbols_to_trade,
+            "full_data": {},
+            "params": StrategyParams(),
+        }
 
         print("=" * 60)
         print("QMT Bridge LIVE Trading Configuration")
