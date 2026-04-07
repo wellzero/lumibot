@@ -1896,6 +1896,7 @@ class StrategyExecutor(Thread):
                     self.strategy.logger.debug(f"Main loop iteration #{loop_count} - Market closed status check")
 
                 # Send data to cloud every minute FIRST - regardless of market status
+                self._last_updated_cloud = datetime.now()
                 should_send_cloud_update = (not hasattr(self, '_last_updated_cloud')) or ((datetime.now() - self._last_updated_cloud) >= timedelta(minutes=1))
                 if should_send_cloud_update:
                     time_since_last = "never" if not hasattr(self, '_last_updated_cloud') else str(datetime.now() - self._last_updated_cloud)

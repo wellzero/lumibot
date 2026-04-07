@@ -143,12 +143,15 @@ class InstitutionalFlowDivergence(Strategy):
 
     def on_trading_iteration(self):
         dt = self.get_datetime()
+
         self.log_message(f"\n=== Trading iteration for {dt.strftime('%Y-%m-%d')} ===")
-        # logging.info(f"\n=== Trading iteration for {dt.strftime('%Y-%m-%d')} ===")
+        
         if self.last_date != dt:
             self.new_entries_today = 0
             self.last_date = dt
         self.portfolio_peak = max(self.portfolio_peak, self.portfolio_value)
+
+        self.log_message(f"Portfolio Value: {self.portfolio_value:.2f}, Peak: {self.portfolio_peak:.2f}, Drawdown: {(self.portfolio_peak - self.portfolio_value) / self.portfolio_peak:.1%}")
 
         self._update_regime(dt)
         self._check_exits(dt)
@@ -159,11 +162,15 @@ class InstitutionalFlowDivergence(Strategy):
                 self.await_market_to_close()
                 return
 
+        self.log_message(f"Index above MA: {self.index_above_ma}")
         if not self.index_above_ma:
             self.await_market_to_close()
             return
 
         signals = self._generate_signals(dt)
+
+        self.log_message(f"Generated signals: {len(signals)}")
+
         if signals:
             self._execute_entries(signals, dt)
         self.await_market_to_close()
@@ -175,8 +182,10 @@ class InstitutionalFlowDivergence(Strategy):
         index_asset = Asset(symbol="SH000300", asset_type=Asset.AssetType.STOCK)
         bars = self.get_historical_prices(index_asset, 30, timestep="day", timeshift=1)
         df_before = bars.df if bars is not None else None
+        
         self.log_message("Regime check for index SH000300: Data points available = {}"\
                      .format(df_before.tail(5) if df_before is not None else 0))
+        
         if df_before is not None and len(df_before) > 22:
             closes = df_before['close'].values[-21:-1]
             if len(closes) >= 20:
@@ -417,20 +426,20 @@ if __name__ == "__main__":
         # Use QMT Bridge for online data
         logging.info("Loading historical data from QMT Bridge...")
         
-        from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
-        pandas_data = get_qmt_symbols_historical_price(
-            symbols=all_symbols,
-            start_date=data_loading_start,
-            end_date=backtesting_end_date,
-            config=QMT_BRIDGE_CONFIG,
-            dividend_type='front'
-        )
+        # from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
+        # pandas_data = get_qmt_symbols_historical_price(
+        #     symbols=all_symbols,
+        #     start_date=data_loading_start,
+        #     end_date=backtesting_end_date,
+        #     config=QMT_BRIDGE_CONFIG,
+        #     dividend_type='front'
+        # )
 
-        # from quant_free.dataset.xq_daily_data import multi_sym_daily_load_for_lumibot
-        # pandas_data = multi_sym_daily_load_for_lumibot(market="cn", symbols=all_symbols, 
-        #                                  start_date=data_loading_start, 
-        #                                  end_date=backtesting_end_date, 
-        #                                  column_option="all", dir_option='xtq')
+        from quant_free.dataset.xq_daily_data import multi_sym_daily_load_for_lumibot
+        pandas_data = multi_sym_daily_load_for_lumibot(market="cn", symbols=all_symbols, 
+                                         start_date=data_loading_start, 
+                                         end_date=backtesting_end_date, 
+                                         column_option="all", dir_option='xtq')
 
 
         strategy_params = {
@@ -488,10 +497,6 @@ if __name__ == "__main__":
 
     # ── Live trading mode ───────────────────────────────────────────────────
     else:
-        if not qmt_account_id:
-            print("ERROR: QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
-            sys.exit(1)
-
         # Load symbols from selector for live trading
         today = datetime.now().strftime('%Y-%m-%d')
         symbols_to_trade = load_symbols_from_selector(end_date=today, top_n=50)
@@ -522,10 +527,6 @@ if __name__ == "__main__":
         print("=" * 60)
         print("QMT Bridge LIVE Trading Configuration")
         print("=" * 60)
-        print(f"QMT Bridge Host: {qmt_host}")
-        print(f"QMT Bridge Port: {qmt_port}")
-        print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
-        print(f"Account ID: {qmt_account_id}")
         print(f"Symbols: {len(symbols_to_trade)} (from selector)")
         print("=" * 60)
         print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
