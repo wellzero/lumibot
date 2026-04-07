@@ -546,17 +546,12 @@ if __name__ == "__main__":
 
         # Create data source for live market data
         data_source = QMTBridgeData(
-            host=qmt_host,
-            port=qmt_port,
-            api_key=qmt_api_key,
+            QMT_BRIDGE_CONFIG
         )
 
         # Create broker for live order execution
         broker = QMTBridgeBroker(
-            host=qmt_host,
-            port=qmt_port,
-            api_key=qmt_api_key,
-            account_id=qmt_account_id,
+            QMT_BRIDGE_CONFIG,
             data_source=data_source,
             connect_stream=True,
         )

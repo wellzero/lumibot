@@ -149,9 +149,7 @@ class QMTBridgeData(DataSource):
 
     def __init__(
         self,
-        host: str,
-        port: int = 8000,
-        api_key: str = "",
+        config,
         tzinfo=None,
         dividend_type: str = "front",
         fill_data: bool = True,
@@ -181,8 +179,8 @@ class QMTBridgeData(DataSource):
 
         super().__init__(api_key=api_key, tzinfo=tzinfo, **kwargs)
 
-        self.host = host
-        self.port = port
+        self.host = config["host"]
+        self.port = config.get("port", 8000)
         self.dividend_type = dividend_type
         self.fill_data = fill_data
 

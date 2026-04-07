@@ -90,10 +90,7 @@ class QMTBridgeBroker(Broker):
 
     def __init__(
         self,
-        host: str,
-        port: int = 8000,
-        api_key: str = "",
-        account_id: str = "",
+        config,
         data_source=None,
         connect_stream: bool = True,
         **kwargs
@@ -102,14 +99,15 @@ class QMTBridgeBroker(Broker):
 
         Parameters
         ----------
-        host : str
-            QMT Bridge server host address.
-        port : int, optional
-            QMT Bridge server port, default 8000.
-        api_key : str
-            API key for authentication.
-        account_id : str, optional
-            Trading account ID.
+        config: dict
+            host : str
+                QMT Bridge server host address.
+            port : int, optional
+                QMT Bridge server port, default 8000.
+            api_key : str
+                API key for authentication.
+            account_id : str, optional
+                Trading account ID.
         data_source : DataSource
             Data source for market data.
         connect_stream : bool, optional
@@ -117,10 +115,10 @@ class QMTBridgeBroker(Broker):
         **kwargs
             Additional keyword arguments.
         """
-        self.host = host
-        self.port = port
-        self._api_key = api_key
-        self.account_id = account_id
+        self.host = config["host"]
+        self.port = config.get("port", 8000)
+        self._api_key = config.get("api_key", "")
+        self.account_id = config.get("account_id", "")
         self._client = None
 
         # Set market for Chinese exchanges (Shanghai Stock Exchange)
