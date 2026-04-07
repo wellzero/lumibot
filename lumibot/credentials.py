@@ -506,9 +506,8 @@ if not is_backtesting or is_backtesting.lower() == "false":
             broker = Bitunix(BITUNIX_CONFIG)
         elif trading_broker_name.lower() == "qmt_bridge":
             from .data_sources import QMTBridgeData
-            qmt_data_params = {k: v for k, v in QMT_BRIDGE_CONFIG.items() if k != "account_id"}
-            qmt_data_source = QMTBridgeData(**qmt_data_params)
-            broker = QMTBridgeBroker(**QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
+            qmt_data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
+            broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
         elif trading_broker_name.lower() == "projectx":
             try:
                 # Get specified firm or use auto-detection
@@ -617,9 +616,8 @@ if not is_backtesting or is_backtesting.lower() == "false":
             broker = Bitunix(BITUNIX_CONFIG)
         elif QMT_BRIDGE_CONFIG["account_id"]:
             from .data_sources import QMTBridgeData
-            qmt_data_params = {k: v for k, v in QMT_BRIDGE_CONFIG.items() if k != "account_id"}
-            qmt_data_source = QMTBridgeData(**qmt_data_params)
-            broker = QMTBridgeBroker(**QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
+            qmt_data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
+            broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
         elif get_available_projectx_firms():
             try:
                 # Use first available ProjectX firm
@@ -664,8 +662,7 @@ if not is_backtesting or is_backtesting.lower() == "false":
                 data_source = PolygonData(api_key=POLYGON_API_KEY)
             elif data_source_name.lower() == "qmt_bridge":
                 from .data_sources import QMTBridgeData
-                qmt_data_params = {k: v for k, v in QMT_BRIDGE_CONFIG.items() if k != "account_id"}
-                data_source = QMTBridgeData(**qmt_data_params)
+                data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
             elif data_source_name.lower() == "yahoo":
                 from .data_sources import YahooData
                 
