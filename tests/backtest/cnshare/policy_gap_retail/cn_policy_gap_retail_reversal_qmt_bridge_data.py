@@ -49,6 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
+from lumibot import LUMIBOT_SOURCE_PATH
 from lumibot.strategies import Strategy
 from lumibot.entities import Asset, Data
 from lumibot.backtesting import QMTBridgeDataBacktesting
@@ -58,12 +59,14 @@ import matplotlib
 matplotlib.rcParams['font.family'] = 'DejaVu Sans'
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 
-
 # ── Mode selection ──────────────────────────────────────────────────────────
 
 # Load QMT Bridge environment variables
-QMT_BRIDGE_ENV_PATH = "/home/quant_volumn/docker/data/qmt-bridge/.env"
+QMT_BRIDGE_ENV_PATH = f"{Path(LUMIBOT_SOURCE_PATH).parent}/.env"
 load_dotenv(QMT_BRIDGE_ENV_PATH)
+
+STRATEGY_NAME = "cn_policy_gap_retail_reversal"
+STRATEGY_VERSION = "6.0"
 
 DEFAULT_STOCKS = [
     '300750.SZ', '002129.SZ', '601865.SH', '002594.SZ',
@@ -453,46 +456,49 @@ if __name__ == "__main__":
         data_loading_start = pd.to_datetime(backtesting_start_date) - pd.Timedelta(days=lookback_period + 50)
         data_loading_start_str = data_loading_start.strftime('%Y-%m-%d')
 
+        # Load historical data
+        logging.info("Loading historical data...")
+
+        from quant_free.dataset.xq_daily_data import multi_sym_daily_load_for_lumibot
+        pandas_data = multi_sym_daily_load_for_lumibot(
+            market="cn", symbols=symbols_to_trade,
+            start_date=data_loading_start_str,
+            end_date=backtesting_end_date,
+            column_option="all", dir_option='xtq'
+        )
+
         test_date = datetime.now().strftime('%Y-%m-%d')
-        quant_data_dir = "/home/quant_volumn/quant_data"
-        execution_folder_path = f"{quant_data_dir}/html/backtest/{test_date}/cn_policy_gap_retail_reversal"
+        quant_data_dir = os.getenv("QUANT_DATA_DIR", "/home/quant_volumn/quant_data")
+        execution_folder_path = f"{quant_data_dir}/html/backtest/{test_date}/{STRATEGY_NAME}"
         Path(execution_folder_path).mkdir(parents=True, exist_ok=True)
-        html_link = f"{os.getenv('RESULT_LINK', '')}/backtest/{test_date}/cn_policy_gap_retail_reversal"
+        html_link = f"{os.getenv('RESULT_LINK', '')}/backtest/{test_date}/{STRATEGY_NAME}"
 
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
-        base_filename = f"{execution_folder_path}/cn_policy_gap_retail_reversal_{timestamp}"
+        base_filename = f"{execution_folder_path}/{STRATEGY_NAME}_{timestamp}"
 
         print("=" * 60)
         print("QMT Bridge Backtest Configuration")
         print("=" * 60)
-        print(f"QMT Bridge Host: {qmt_host}")
-        print(f"QMT Bridge Port: {qmt_port}")
-        print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
         print(f"Symbols: {len(symbols_to_trade)}")
         print(f"Data loading from: {data_loading_start_str} (includes {lookback_period}+50 days lookback)")
         print(f"Backtest period: {backtesting_start_date} to {backtesting_end_date}")
         print("=" * 60)
-
-        print(f"\nStarting backtest with QMTBridgeDataBacktesting")
-        print(f"Strategy: GAP FADE (contrarian - NO LOOK-AHEAD)")
+        print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
         print(f"Entry: Gap DOWN 2-10%, vol > 1.2x")
         print(f"Exit: 5% profit / 3% stop / 5-day max hold")
+        print("=" * 60)
 
+        from lumibot.backtesting import PandasDataBacktesting
         results = PolicyGapRetailReversal.backtest(
-            QMTBridgeDataBacktesting,
+            PandasDataBacktesting,
             pd.to_datetime(backtesting_start_date),
             pd.to_datetime(backtesting_end_date),
             benchmark_asset="000001.SS",
+            pandas_data=pandas_data,
+            budget=10000,
             sleeptime="1D",
             logfile=f"{base_filename}_log.txt",
             stats_file=f"{base_filename}_stats.csv",
-            config={
-                "host": qmt_host,
-                "port": qmt_port,
-                "api_key": qmt_api_key,
-                "symbols": symbols_to_trade,
-                "dividend_type": "front"  # Use forward adjustment (QFQ/前复权) to match original data source
-            },
             parameters=strategy_params,
         )
 
@@ -512,20 +518,12 @@ if __name__ == "__main__":
 
     # ── Live trading mode ───────────────────────────────────────────────────
     else:
-        if not QMT_BRIDGE_CONFIG.get("account_id"):
-            print("ERROR: QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
-            sys.exit(1)
-
         print("=" * 60)
         print("QMT Bridge LIVE Trading Configuration")
         print("=" * 60)
-        print(f"QMT Bridge Host: {QMT_BRIDGE_CONFIG['host']}")
-        print(f"QMT Bridge Port: {QMT_BRIDGE_CONFIG['port']}")
-        print(f"API Key configured: {'Yes' if QMT_BRIDGE_CONFIG.get('api_key') else 'No'}")
-        print(f"Account ID: {QMT_BRIDGE_CONFIG['account_id']}")
         print(f"Symbols: {len(symbols_to_trade)}")
         print("=" * 60)
-        print("Strategy: GAP FADE (contrarian)")
+        print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
         print(f"Entry: Gap DOWN 2-10%, vol > 1.2x")
         print(f"Exit: 5% profit / 3% stop / 5-day max hold")
         print("=" * 60)
