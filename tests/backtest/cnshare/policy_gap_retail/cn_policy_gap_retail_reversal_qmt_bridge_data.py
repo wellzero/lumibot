@@ -423,10 +423,7 @@ class PolicyGapRetailReversal(Strategy):
 
 if __name__ == "__main__":
     # ── Common config ───────────────────────────────────────────────────────
-    qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
-    qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
-    qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
-    qmt_account_id = os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
+    from lumibot.credentials import QMT_BRIDGE_CONFIG
     symbols_to_trade = DEFAULT_STOCKS
 
     strategy_params = {
@@ -515,17 +512,17 @@ if __name__ == "__main__":
 
     # ── Live trading mode ───────────────────────────────────────────────────
     else:
-        if not qmt_account_id:
+        if not QMT_BRIDGE_CONFIG.get("account_id"):
             print("ERROR: QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
             sys.exit(1)
 
         print("=" * 60)
         print("QMT Bridge LIVE Trading Configuration")
         print("=" * 60)
-        print(f"QMT Bridge Host: {qmt_host}")
-        print(f"QMT Bridge Port: {qmt_port}")
-        print(f"API Key configured: {'Yes' if qmt_api_key else 'No'}")
-        print(f"Account ID: {qmt_account_id}")
+        print(f"QMT Bridge Host: {QMT_BRIDGE_CONFIG['host']}")
+        print(f"QMT Bridge Port: {QMT_BRIDGE_CONFIG['port']}")
+        print(f"API Key configured: {'Yes' if QMT_BRIDGE_CONFIG.get('api_key') else 'No'}")
+        print(f"Account ID: {QMT_BRIDGE_CONFIG['account_id']}")
         print(f"Symbols: {len(symbols_to_trade)}")
         print("=" * 60)
         print("Strategy: GAP FADE (contrarian)")
@@ -538,18 +535,11 @@ if __name__ == "__main__":
         from lumibot.traders import Trader
 
         # Create data source for live market data
-        data_source = QMTBridgeData(
-            host=qmt_host,
-            port=qmt_port,
-            api_key=qmt_api_key,
-        )
+        data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
 
         # Create broker for live order execution
         broker = QMTBridgeBroker(
-            host=qmt_host,
-            port=qmt_port,
-            api_key=qmt_api_key,
-            account_id=qmt_account_id,
+            QMT_BRIDGE_CONFIG,
             data_source=data_source,
             connect_stream=True,
         )

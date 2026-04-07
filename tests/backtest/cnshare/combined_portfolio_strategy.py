@@ -111,21 +111,17 @@ def run_live_trading(strategies_config: List, lot_size: int = 100, max_positions
     from lumibot.data_sources import QMTBridgeData
     from lumibot.brokers import QMTBridgeBroker
     from lumibot.traders import Trader
+    from lumibot.credentials import QMT_BRIDGE_CONFIG
 
-    qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
-    qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
-    qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
-    qmt_account_id = os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
-
-    if not qmt_account_id:
+    if not QMT_BRIDGE_CONFIG.get("account_id"):
         logger.error("QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
         sys.exit(1)
 
     logger.info("=" * 70)
     logger.info("Combined Portfolio Strategy - LIVE TRADING")
     logger.info("=" * 70)
-    logger.info(f"QMT Bridge: {qmt_host}:{qmt_port}")
-    logger.info(f"Account ID: {qmt_account_id}")
+    logger.info(f"QMT Bridge: {QMT_BRIDGE_CONFIG['host']}:{QMT_BRIDGE_CONFIG['port']}")
+    logger.info(f"Account ID: {QMT_BRIDGE_CONFIG['account_id']}")
     logger.info("=" * 70)
     logger.info("Strategies:")
     for strategy_class, strategy_id, _ in strategies_config:
@@ -135,21 +131,10 @@ def run_live_trading(strategies_config: List, lot_size: int = 100, max_positions
     logger.info("Starting live trading... (Ctrl+C to stop)")
 
     # Create data source
-    data_source = QMTBridgeData(
-        host=qmt_host,
-        port=qmt_port,
-        api_key=qmt_api_key,
-    )
+    data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
 
     # Create broker
-    broker = QMTBridgeBroker(
-        host=qmt_host,
-        port=qmt_port,
-        api_key=qmt_api_key,
-        account_id=qmt_account_id,
-        data_source=data_source,
-        connect_stream=True,
-    )
+    broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=data_source, connect_stream=True)
 
     # Create strategy
     strategy = CombinedPortfolioStrategy(
