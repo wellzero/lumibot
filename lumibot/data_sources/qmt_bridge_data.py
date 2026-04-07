@@ -33,6 +33,62 @@ from lumibot.tools.lumibot_logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def normalize_qmt_dataframe_time(df: pd.DataFrame, timezone: str = "Asia/Shanghai") -> pd.DataFrame:
+    """Normalize time column and localize timezone for QMT Bridge DataFrame.
+
+    This function handles the time column conversion from QMT Bridge data:
+    - Converts "time" column from milliseconds to datetime
+    - Converts "index" column to datetime
+    - Sets the datetime as the DataFrame index
+    - Localizes to the specified timezone if not already timezone-aware
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame from QMT Bridge with either "time" or "index" column.
+    timezone : str, optional
+        Timezone to localize to if index is not timezone-aware.
+        Default is "Asia/Shanghai" for Chinese markets.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with datetime index localized to the specified timezone.
+
+    Raises
+    ------
+    ValueError
+        If neither "time" nor "index" column is found in the DataFrame.
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    if "time" in df.columns:
+        # QMT returns time as timestamp in milliseconds (UTC)
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df.set_index("time", inplace=True)
+    elif "index" in df.columns:
+        df["time"] = pd.to_datetime(df["index"], utc=True)
+        df.set_index("time", inplace=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        # Index is already datetime, just ensure UTC
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+    else:
+        raise ValueError("DataFrame must have 'time' or 'index' column, or have a DatetimeIndex")
+
+    # Convert from UTC to target timezone if not already in target timezone
+    tz = pytz.timezone(timezone)
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert(tz)
+    else:
+        df.index = df.index.tz_localize(tz)
+
+    return df
+
 def qmt_bridge_normalize_symbol(symbol: str) -> str:
     # Handle SHxxxxxx → xxxxxx.SH format
     if symbol.startswith("SH") and len(symbol) > 2:
@@ -177,7 +233,7 @@ class QMTBridgeData(DataSource):
         # Set timezone to Asia/Shanghai for Chinese markets
         tzinfo = pytz.timezone("Asia/Shanghai")
 
-        super().__init__(api_key=api_key, tzinfo=tzinfo, **kwargs)
+        super().__init__(tzinfo=tzinfo, **kwargs)
 
         self.host = config["host"]
         self.port = config.get("port", 8000)
@@ -369,9 +425,28 @@ class QMTBridgeData(DataSource):
 
         try:
             # Calculate time range
-            if timeshift:
+            # timeshift can be:
+            # - None: use current datetime
+            # - int: number of days to shift back from now
+            # - timedelta: duration to shift back from now
+            # - datetime: direct end datetime
+            if timeshift is None:
+                end_dt = datetime.now(self.tzinfo)
+            elif isinstance(timeshift, int):
+                # Integer means days to shift back
+                end_dt = datetime.now(self.tzinfo) - timedelta(days=timeshift)
+            elif isinstance(timeshift, timedelta):
+                # Timedelta to shift back
+                end_dt = datetime.now(self.tzinfo) - timeshift
+            elif isinstance(timeshift, datetime):
+                # Direct datetime object
                 end_dt = timeshift
+                # Ensure timezone-aware
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=self.tzinfo)
             else:
+                # Unknown type, default to current time
+                logger.warning(f"Unknown timeshift type: {type(timeshift)}, using current time")
                 end_dt = datetime.now(self.tzinfo)
 
             # Get more bars than needed to ensure we have enough after filtering
@@ -409,15 +484,15 @@ class QMTBridgeData(DataSource):
             # Build normalized DataFrame with required columns
             normalized_data = {}
 
-            # Handle time/index
+            # Handle time/index - use UTC for initial parsing
             if "time" in df.columns:
                 # QMT returns time as timestamp in milliseconds
-                normalized_data["time"] = pd.to_datetime(df["time"], unit="ms")
+                normalized_data["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
             elif "index" in df.columns:
-                normalized_data["time"] = pd.to_datetime(df["index"])
+                normalized_data["time"] = pd.to_datetime(df["index"], utc=True)
             else:
                 # Try to use the index if it's datetime-like
-                normalized_data["time"] = pd.to_datetime(df.index)
+                normalized_data["time"] = pd.to_datetime(df.index, utc=True)
 
             # Get OHLCV columns (case-insensitive)
             for col in ["open", "high", "low", "close", "volume"]:
@@ -431,14 +506,9 @@ class QMTBridgeData(DataSource):
             # Create DataFrame with normalized columns
             normalized_df = pd.DataFrame(normalized_data)
 
-            # Set time as index
+            # Set time as index and convert to target timezone
             normalized_df.set_index("time", inplace=True)
-
-            # Localize index if not already timezone-aware
-            if normalized_df.index.tz is None:
-                normalized_df.index = normalized_df.index.tz_localize(self.tzinfo)
-            else:
-                normalized_df.index = normalized_df.index.tz_convert(self.tzinfo)
+            normalized_df.index = normalized_df.index.tz_convert(self.tzinfo)
 
             # Sort by index (oldest first)
             normalized_df.sort_index(inplace=True)
@@ -745,17 +815,7 @@ def get_qmt_symbols_historical_price(
                 if qmt_symbol in result and result[qmt_symbol] is not None and not result[qmt_symbol].empty:
                     df = result[qmt_symbol]
 
-                    if "time" in df.columns:
-                        df = df.copy()
-                        df["time"] = pd.to_datetime(df["time"], unit="ms")
-                        df.set_index("time", inplace=True)
-                    elif "index" in df.columns:
-                        df = df.copy()
-                        df["time"] = pd.to_datetime(df["index"])
-                        df.set_index("time", inplace=True)
-
-                    if df.index.tz is None:
-                        df.index = df.index.tz_localize("Asia/Shanghai")
+                    df = normalize_qmt_dataframe_time(df, timezone="Asia/Shanghai")
 
                     required_cols = ["open", "high", "low", "close", "volume"]
                     keep_cols = [c for c in required_cols if c in df.columns]

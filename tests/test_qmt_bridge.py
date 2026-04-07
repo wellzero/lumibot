@@ -33,11 +33,12 @@ def qmt_bridge_data(mock_qmt_client):
     with patch('qmt_bridge.QMTClient', return_value=mock_qmt_client):
         from lumibot.data_sources.qmt_bridge_data import QMTBridgeData
 
-        data_source = QMTBridgeData(
-            host="192.168.1.100",
-            port=8000,
-            api_key="test-key",
-        )
+        config = {
+            "host": "192.168.1.100",
+            "port": 8000,
+            "api_key": "test-key",
+        }
+        data_source = QMTBridgeData(config)
         # Set the client directly to avoid lazy initialization
         data_source._client = mock_qmt_client
         return data_source
@@ -55,11 +56,14 @@ def qmt_bridge_broker(mock_qmt_client):
         data_source.tzinfo = pytz.timezone("Asia/Shanghai")
         data_source.get_datetime.return_value = datetime.now(pytz.timezone("Asia/Shanghai"))
 
+        config = {
+            "host": "192.168.1.100",
+            "port": 8000,
+            "api_key": "test-key",
+            "account_id": "12345678",
+        }
         broker = QMTBridgeBroker(
-            host="192.168.1.100",
-            port=8000,
-            api_key="test-key",
-            account_id="12345678",
+            config,
             data_source=data_source,
             connect_stream=False,
         )
