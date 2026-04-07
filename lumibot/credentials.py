@@ -366,10 +366,10 @@ BITUNIX_CONFIG = {
 
 # QMT Configuration
 QMT_BRIDGE_CONFIG = {
-    "HOST": os.getenv("QMT_BRIDGE_HOST", "localhost"),
-    "PORT":  int(os.getenv("QMT_BRIDGE_PORT", "8083")),
-    "API_KEY":  os.getenv("QMT_BRIDGE_API_KEY", ""),
-    "ACCOUNT_ID": os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
+    "host": os.getenv("QMT_BRIDGE_HOST", "localhost"),
+    "port":  int(os.getenv("QMT_BRIDGE_PORT", "8083")),
+    "api_key":  os.getenv("QMT_BRIDGE_API_KEY", ""),
+    "account_id": os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
 }
 
 # ProjectX URL mappings - REST API base URLs (v2 gateway URLs preferred)
@@ -506,8 +506,9 @@ if not is_backtesting or is_backtesting.lower() == "false":
             broker = Bitunix(BITUNIX_CONFIG)
         elif trading_broker_name.lower() == "qmt_bridge":
             from .data_sources import QMTBridgeData
-            qmt_data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
-            broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
+            qmt_data_params = {k: v for k, v in QMT_BRIDGE_CONFIG.items() if k != "account_id"}
+            qmt_data_source = QMTBridgeData(**qmt_data_params)
+            broker = QMTBridgeBroker(**QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
         elif trading_broker_name.lower() == "projectx":
             try:
                 # Get specified firm or use auto-detection
@@ -614,10 +615,11 @@ if not is_backtesting or is_backtesting.lower() == "false":
             broker = Ccxt(KRAKEN_CONFIG)
         elif BITUNIX_CONFIG["API_KEY"] and BITUNIX_CONFIG["API_SECRET"]:
             broker = Bitunix(BITUNIX_CONFIG)
-        elif QMT_BRIDGE_CONFIG["ACCOUNT_ID"]:
+        elif QMT_BRIDGE_CONFIG["account_id"]:
             from .data_sources import QMTBridgeData
-            qmt_data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
-            broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
+            qmt_data_params = {k: v for k, v in QMT_BRIDGE_CONFIG.items() if k != "account_id"}
+            qmt_data_source = QMTBridgeData(**qmt_data_params)
+            broker = QMTBridgeBroker(**QMT_BRIDGE_CONFIG, data_source=qmt_data_source)
         elif get_available_projectx_firms():
             try:
                 # Use first available ProjectX firm
@@ -662,7 +664,8 @@ if not is_backtesting or is_backtesting.lower() == "false":
                 data_source = PolygonData(api_key=POLYGON_API_KEY)
             elif data_source_name.lower() == "qmt_bridge":
                 from .data_sources import QMTBridgeData
-                data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
+                qmt_data_params = {k: v for k, v in QMT_BRIDGE_CONFIG.items() if k != "account_id"}
+                data_source = QMTBridgeData(**qmt_data_params)
             elif data_source_name.lower() == "yahoo":
                 from .data_sources import YahooData
                 
