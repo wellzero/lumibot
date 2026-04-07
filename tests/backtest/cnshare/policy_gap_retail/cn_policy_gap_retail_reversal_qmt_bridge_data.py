@@ -546,6 +546,7 @@ if __name__ == "__main__":
         strategy = PolicyGapRetailReversal(
             broker=broker,
             parameters=strategy_params,
+            sleeptime="1D",
         )
 
         # Run live trading

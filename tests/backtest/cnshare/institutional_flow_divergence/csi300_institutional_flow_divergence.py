@@ -551,10 +551,11 @@ if __name__ == "__main__":
             connect_stream=True,
         )
 
-        # Create strategy instance
+        # Create strategy instance with sleeptime="1D" for daily iteration
         strategy = InstitutionalFlowDivergence(
             broker=broker,
             parameters=strategy_params,
+            sleeptime="1D",
         )
 
         # Run live trading

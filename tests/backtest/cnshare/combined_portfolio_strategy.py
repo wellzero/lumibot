@@ -227,6 +227,7 @@ if __name__ == "__main__":
                 "lot_size": 100,
                 "max_positions": 12,
             },
+            sleeptime="1D",
         )
 
         trader = Trader(backtest=False)
