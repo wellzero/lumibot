@@ -43,6 +43,7 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
+from lumibot import LUMIBOT_SOURCE_PATH
 from lumibot.strategies import Strategy
 from lumibot.entities import Asset, Data
 from lumibot.backtesting import QMTBridgeDataBacktesting
@@ -57,7 +58,7 @@ logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 # ── Mode selection ──────────────────────────────────────────────────────────
 
 # Load QMT Bridge environment variables
-QMT_BRIDGE_ENV_PATH = "/home/quant_volumn/docker/data/qmt-bridge/.env"
+QMT_BRIDGE_ENV_PATH = f"{Path(LUMIBOT_SOURCE_PATH).parent}/.env"
 load_dotenv(QMT_BRIDGE_ENV_PATH)
 
 STRATEGY_NAME = "csi300_institutional_flow_divergence"
