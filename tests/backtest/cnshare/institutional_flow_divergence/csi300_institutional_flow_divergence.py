@@ -395,10 +395,7 @@ def load_symbols_from_selector(end_date: str, top_n: int = 50) -> list:
 
 if __name__ == "__main__":
     # ── Common config ───────────────────────────────────────────────────────
-    qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
-    qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
-    qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
-    qmt_account_id = os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
+    from lumibot.credentials import QMT_BRIDGE_CONFIG
 
     # ── Backtest mode ───────────────────────────────────────────────────────
     if IS_BACKTESTING:
@@ -425,9 +422,7 @@ if __name__ == "__main__":
             symbols=all_symbols,
             start_date=data_loading_start,
             end_date=backtesting_end_date,
-            host=qmt_host,
-            port=qmt_port,
-            api_key=qmt_api_key,
+            config=QMT_BRIDGE_CONFIG,
             dividend_type='front'
         )
 
@@ -515,9 +510,7 @@ if __name__ == "__main__":
             symbols=symbols_to_trade,
             start_date=data_loading_start,
             end_date=data_loading_end,
-            host=qmt_host,
-            port=qmt_port,
-            api_key=qmt_api_key,
+            config=QMT_BRIDGE_CONFIG,
             dividend_type='front'
         )
 

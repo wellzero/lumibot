@@ -158,10 +158,7 @@ def run_backtest(strategies_config: List, lot_size: int = 100, max_positions: in
                   start_date: str = '2022-01-01', end_date: str = '2024-12-31'):
     """Run backtest with QMT Bridge data."""
     from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
-
-    qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
-    qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
-    qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
+    from lumibot.credentials import QMT_BRIDGE_CONFIG
 
     # Calculate data loading start with lookback
     lookback_period = 100
@@ -201,9 +198,7 @@ def run_backtest(strategies_config: List, lot_size: int = 100, max_positions: in
         symbols=list(all_symbols),
         start_date=data_loading_start_str,
         end_date=end_date,
-        host=qmt_host,
-        port=qmt_port,
-        api_key=qmt_api_key,
+        config=QMT_BRIDGE_CONFIG,
         dividend_type='front'
     )
 

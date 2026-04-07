@@ -81,9 +81,6 @@ class QMTBridgeDataBacktesting(PandasDataBacktesting):
         config = config or {}
 
         if pandas_data is None:
-            host = config.get("host", "localhost")
-            port = config.get("port", 8083)
-            api_key = config.get("api_key", "")
             symbols = config.get("symbols", [])
             dividend_type = config.get("dividend_type", "front")  # Default to "front" for forward adjustment
 
@@ -94,9 +91,7 @@ class QMTBridgeDataBacktesting(PandasDataBacktesting):
                 symbols=symbols,
                 start_date=start_str,
                 end_date=end_str,
-                host=host,
-                port=port,
-                api_key=api_key,
+                config=config,
                 dividend_type=dividend_type,
             )
 

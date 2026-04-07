@@ -654,9 +654,7 @@ def get_qmt_symbols_historical_price(
     symbols: list,
     start_date: str,
     end_date: str,
-    host: str,
-    port: int,
-    api_key: str,
+    config: dict,
     dividend_type: str = "front",
     lookback_days: int = 60,
 ):
@@ -673,12 +671,11 @@ def get_qmt_symbols_historical_price(
         Backtest start date in ``'YYYY-MM-DD'`` format.
     end_date : str
         Backtest end date in ``'YYYY-MM-DD'`` format.
-    host : str
-        QMT Bridge server host.
-    port : int
-        QMT Bridge server port.
-    api_key : str
-        API key for authentication.
+    config : dict
+        QMT Bridge configuration dict with keys:
+        - host: QMT Bridge server host
+        - port: QMT Bridge server port
+        - api_key: API key for authentication
     dividend_type : str, optional
         Dividend adjustment type: ``"none"``, ``"front"`` (forward),
         ``"back"`` (backward), ``"front_ratio"``, ``"back_ratio"``.
@@ -700,13 +697,7 @@ def get_qmt_symbols_historical_price(
 
     logger.info("Fetching data from QMT Bridge for %d symbols (%s ~ %s)", len(symbols), fetch_start, fetch_end)
 
-    data_source = QMTBridgeData(
-        host=host,
-        port=port,
-        api_key=api_key,
-        dividend_type=dividend_type,
-        fill_data=True,
-    )
+    data_source = QMTBridgeData(config, dividend_type=dividend_type, fill_data=True)
 
     client = data_source._get_client()
 

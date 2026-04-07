@@ -431,10 +431,8 @@ class PolicyGapRetailReversal(Strategy):
 
 
 if __name__ == "__main__":
-    # Get QMT Bridge configuration from environment
-    qmt_host = os.getenv("QMT_BRIDGE_HOST", "localhost")
-    qmt_port = int(os.getenv("QMT_BRIDGE_PORT", "8083"))
-    qmt_api_key = os.getenv("QMT_BRIDGE_API_KEY", "")
+    # Get QMT Bridge configuration from credentials
+    from lumibot.credentials import QMT_BRIDGE_CONFIG
 
     symbols_to_backtest = DEFAULT_STOCKS
 
@@ -472,9 +470,7 @@ if __name__ == "__main__":
         symbols=symbols_to_backtest,
         start_date=data_loading_start_str,
         end_date=backtesting_end_date,
-        host=qmt_host,
-        port=qmt_port,
-        api_key=qmt_api_key,
+        config=QMT_BRIDGE_CONFIG,
         dividend_type='front'  # Use forward adjustment (QFQ/前复权) to match original data source
     )
 
