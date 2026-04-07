@@ -11,35 +11,29 @@ Strategies:
 2. InstitutionalFlowDivergence - Momentum breakout
 
 Usage:
-    # Backtest (default)
+    # Backtest (default, set IS_BACKTESTING=true in .env)
     python combined_portfolio_strategy.py
 
-    # Live trading
-    python combined_portfolio_strategy.py --live
-
-    # Custom date range
-    python combined_portfolio_strategy.py --start 2023-01-01 --end 2024-12-31
+    # Live trading (set IS_BACKTESTING=false in .env)
+    python combined_portfolio_strategy.py
 """
 
 import os
 import sys
-import argparse
 import logging
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import List, Tuple, Type, Dict, Any
 
-# Add parent paths for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-
+from lumibot import LUMIBOT_SOURCE_PATH
 from lumibot.strategies import Strategy
 from lumibot.backtesting import PandasDataBacktesting
 from lumibot.strategies.portfolio_strategy import CombinedPortfolioStrategy
+from lumibot.credentials import IS_BACKTESTING
 
 # Import existing strategies
-from tests.backtest.cnshare.policy_gap_retail.cn_policy_gap_retail_reversal_qmt import (
+from tests.backtest.cnshare.policy_gap_retail.cn_policy_gap_retail_reversal_qmt_bridge_data import (
     PolicyGapRetailReversal,
     DEFAULT_STOCKS as GAP_FADE_STOCKS,
 )
@@ -54,15 +48,18 @@ logger = logging.getLogger(__name__)
 
 # ── Environment Setup ──────────────────────────────────────────────────────────
 
-QMT_BRIDGE_ENV_PATH = "/home/quant_volumn/docker/data/qmt-bridge/.env"
+QMT_BRIDGE_ENV_PATH = f"{Path(LUMIBOT_SOURCE_PATH).parent}/.env"
 load_dotenv(QMT_BRIDGE_ENV_PATH)
+
+STRATEGY_NAME = "combined_portfolio"
+STRATEGY_VERSION = "1.0"
 
 
 # ── Build Strategy Config ──────────────────────────────────────────────────────
 
-def build_strategies_config(gap_fade_params: Dict = None,
-                             momentum_params: Dict = None,
-                             full_data: Dict = None) -> List:
+def build_strategies_config(gap_fade_params: dict = None,
+                             momentum_params: dict = None,
+                             full_data: dict = None) -> list:
     """
     Build strategy configuration combining Gap Fade + Momentum.
 
@@ -104,151 +101,6 @@ def build_strategies_config(gap_fade_params: Dict = None,
     ]
 
 
-# ── Live Trading Mode ──────────────────────────────────────────────────────────
-
-def run_live_trading(strategies_config: List, lot_size: int = 100, max_positions: int = 12):
-    """Run live trading with QMT Bridge."""
-    from lumibot.data_sources import QMTBridgeData
-    from lumibot.brokers import QMTBridgeBroker
-    from lumibot.traders import Trader
-    from lumibot.credentials import QMT_BRIDGE_CONFIG
-
-    if not QMT_BRIDGE_CONFIG.get("account_id"):
-        logger.error("QMT_BRIDGE_TRADING_ACCOUNT_ID is required for live trading")
-        sys.exit(1)
-
-    logger.info("=" * 70)
-    logger.info("Combined Portfolio Strategy - LIVE TRADING")
-    logger.info("=" * 70)
-    logger.info(f"QMT Bridge: {QMT_BRIDGE_CONFIG['host']}:{QMT_BRIDGE_CONFIG['port']}")
-    logger.info(f"Account ID: {QMT_BRIDGE_CONFIG['account_id']}")
-    logger.info("=" * 70)
-    logger.info("Strategies:")
-    for strategy_class, strategy_id, _ in strategies_config:
-        logger.info(f"  - {strategy_id}: {strategy_class.__name__}")
-    logger.info("Order Interception: ENABLED")
-    logger.info("=" * 70)
-    logger.info("Starting live trading... (Ctrl+C to stop)")
-
-    # Create data source
-    data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
-
-    # Create broker
-    broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=data_source, connect_stream=True)
-
-    # Create strategy
-    strategy = CombinedPortfolioStrategy(
-        broker=broker,
-        parameters={
-            "strategies_config": strategies_config,
-            "lot_size": lot_size,
-            "max_positions": max_positions,
-        },
-    )
-
-    # Run
-    trader = Trader(backtest=False)
-    trader.add_strategy(strategy)
-    trader.run_all()
-
-
-# ── Backtest Mode ──────────────────────────────────────────────────────────────
-
-def run_backtest(strategies_config: List, lot_size: int = 100, max_positions: int = 12,
-                  start_date: str = '2022-01-01', end_date: str = '2024-12-31'):
-    """Run backtest with QMT Bridge data."""
-    from lumibot.data_sources.qmt_bridge_data import get_qmt_symbols_historical_price
-    from lumibot.credentials import QMT_BRIDGE_CONFIG
-
-    # Calculate data loading start with lookback
-    lookback_period = 100
-    data_loading_start = pd.to_datetime(start_date) - pd.Timedelta(days=lookback_period + 50)
-    data_loading_start_str = data_loading_start.strftime('%Y-%m-%d')
-
-    test_date = datetime.now().strftime('%Y-%m-%d')
-    quant_data_dir = os.getenv("QUANT_DATA_DIR", "/home/quant_volumn/quant_data")
-    execution_folder_path = f"{quant_data_dir}/html/backtest/{test_date}/combined_portfolio"
-    Path(execution_folder_path).mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
-    base_filename = f"{execution_folder_path}/combined_portfolio_{timestamp}"
-
-    logger.info("=" * 70)
-    logger.info("Combined Portfolio Strategy - BACKTEST")
-    logger.info("=" * 70)
-    logger.info("Strategies:")
-    for strategy_class, strategy_id, params in strategies_config:
-        logger.info(f"  - {strategy_id}: {strategy_class.__name__}")
-        if params.get('symbols'):
-            logger.info(f"    Symbols: {len(params['symbols'])}")
-    logger.info("Order Interception: ENABLED")
-    logger.info(f"Backtest: {start_date} to {end_date}")
-    logger.info("=" * 70)
-
-    # Collect all symbols from all strategies
-    all_symbols = set()
-    for _, _, params in strategies_config:
-        symbols = params.get('symbols')
-        if symbols:
-            all_symbols.update(symbols)
-
-    # Load data
-    logger.info("Loading data from QMT Bridge...")
-    pandas_data = get_qmt_symbols_historical_price(
-        symbols=list(all_symbols),
-        start_date=data_loading_start_str,
-        end_date=end_date,
-        config=QMT_BRIDGE_CONFIG,
-        dividend_type='front'
-    )
-
-    if not pandas_data:
-        logger.error("No data loaded from QMT Bridge")
-        sys.exit(1)
-
-    logger.info(f"Loaded data for {len(pandas_data)} symbols")
-
-    # Update strategies_config with full_data for strategies that need it
-    updated_config = []
-    for strategy_class, strategy_id, params in strategies_config:
-        params = params.copy()  # Don't modify original
-        if 'full_data' in params and params['full_data'] is None:
-            params['full_data'] = {symbol: df for symbol, df in pandas_data.items()}
-        updated_config.append((strategy_class, strategy_id, params))
-
-    # Run backtest
-    results = CombinedPortfolioStrategy.backtest(
-        PandasDataBacktesting,
-        pd.to_datetime(start_date),
-        pd.to_datetime(end_date),
-        benchmark_asset="000001.SS",
-        pandas_data=pandas_data,
-        sleeptime="1D",
-        logfile=f"{base_filename}_log.txt",
-        stats_file=f"{base_filename}_stats.csv",
-        parameters={
-            "strategies_config": updated_config,
-            "lot_size": lot_size,
-            "max_positions": max_positions,
-        },
-    )
-
-    logger.info(f"Backtest completed: {execution_folder_path}")
-
-    if results:
-        logger.info("=" * 70)
-        logger.info("Backtest Results Summary")
-        logger.info("=" * 70)
-        logger.info(f"Total Return: {results.get('total_return', 'N/A')}")
-        logger.info(f"CAGR: {results.get('cagr', 'N/A')}")
-        logger.info(f"Max Drawdown: {results.get('max_drawdown', 'N/A')}")
-        logger.info(f"Sharpe Ratio: {results.get('sharpe', 'N/A')}")
-        logger.info(f"Total Trades: {results.get('total_trades', 'N/A')}")
-        logger.info("=" * 70)
-
-    return results
-
-
 # ── Entry Point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -259,53 +111,125 @@ if __name__ == "__main__":
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    parser = argparse.ArgumentParser(
-        description="Combined Portfolio Strategy with Order Interception",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run backtest (default)
-  python combined_portfolio_strategy.py
-
-  # Run live trading
-  python combined_portfolio_strategy.py --live
-
-  # Custom date range
-  python combined_portfolio_strategy.py --start 2023-01-01 --end 2024-12-31
-        """
-    )
-
-    # Mode selection
-    parser.add_argument(
-        "--live", action="store_true",
-        help="Run live trading (default: backtest)"
-    )
-
-    # Date range
-    parser.add_argument("--start", type=str, default="2022-01-01", help="Start date")
-    parser.add_argument("--end", type=str, default="2024-12-31", help="End date")
-
-    # Portfolio settings
-    parser.add_argument("--lot-size", type=int, default=100, help="Lot size")
-    parser.add_argument("--max-positions", type=int, default=12, help="Max positions")
-
-    args = parser.parse_args()
+    from lumibot.credentials import QMT_BRIDGE_CONFIG
 
     # Build strategy config
     strategies_config = build_strategies_config()
 
-    # Run in appropriate mode
-    if args.live:
-        run_live_trading(
-            strategies_config=strategies_config,
-            lot_size=args.lot_size,
-            max_positions=args.max_positions,
+    # ── Backtest mode ───────────────────────────────────────────────────────
+    if IS_BACKTESTING:
+        backtesting_start_date = '2022-01-01'
+        backtesting_end_date = '2024-12-31'
+
+        # Calculate data loading start with lookback
+        lookback_period = 100
+        data_loading_start = pd.to_datetime(backtesting_start_date) - pd.Timedelta(days=lookback_period + 50)
+        data_loading_start_str = data_loading_start.strftime('%Y-%m-%d')
+
+        # Collect all symbols from all strategies
+        all_symbols = set()
+        for _, _, params in strategies_config:
+            symbols = params.get('symbols')
+            if symbols:
+                all_symbols.update(symbols)
+
+        # Load data
+        logging.info("Loading historical data for %d symbols...", len(all_symbols))
+
+        from quant_free.dataset.xq_daily_data import multi_sym_daily_load_for_lumibot
+        pandas_data = multi_sym_daily_load_for_lumibot(
+            market="cn", symbols=list(all_symbols),
+            start_date=data_loading_start_str,
+            end_date=backtesting_end_date,
+            column_option="all", dir_option='xtq'
         )
+
+        logging.info("Loaded data for %d symbols", len(pandas_data))
+
+        # Update strategies_config with full_data for strategies that need it
+        updated_config = []
+        for strategy_class, strategy_id, params in strategies_config:
+            params = params.copy()
+            if 'full_data' in params and params['full_data'] is None:
+                params['full_data'] = {symbol: df for symbol, df in pandas_data.items()}
+            updated_config.append((strategy_class, strategy_id, params))
+
+        test_date = datetime.now().strftime('%Y-%m-%d')
+        quant_data_dir = os.getenv("QUANT_DATA_DIR", "/home/quant_volumn/quant_data")
+        execution_folder_path = f"{quant_data_dir}/html/backtest/{test_date}/{STRATEGY_NAME}"
+        Path(execution_folder_path).mkdir(parents=True, exist_ok=True)
+        html_link = f"{os.getenv('RESULT_LINK', '')}/backtest/{test_date}/{STRATEGY_NAME}"
+
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M')
+        base_filename = f"{execution_folder_path}/{STRATEGY_NAME}_{timestamp}"
+
+        print("=" * 60)
+        print("Combined Portfolio Strategy - BACKTEST")
+        print("=" * 60)
+        print(f"Symbols: {len(all_symbols)}")
+        print(f"Backtest: {backtesting_start_date} to {backtesting_end_date}")
+        print("=" * 60)
+        print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
+        print(f"Strategies: Gap Fade + Momentum Breakout")
+        print("=" * 60)
+
+        results = CombinedPortfolioStrategy.backtest(
+            PandasDataBacktesting,
+            pd.to_datetime(backtesting_start_date),
+            pd.to_datetime(backtesting_end_date),
+            benchmark_asset="000001.SS",
+            pandas_data=pandas_data,
+            budget=10000,
+            sleeptime="1D",
+            logfile=f"{base_filename}_log.txt",
+            stats_file=f"{base_filename}_stats.csv",
+            parameters={
+                "strategies_config": updated_config,
+                "lot_size": 100,
+                "max_positions": 12,
+            },
+        )
+
+        print(f"\nBacktest completed: {execution_folder_path}")
+        print(f"HTML results available at: {html_link}")
+
+        if results:
+            print("\n" + "=" * 60)
+            print("Backtest Results Summary")
+            print("=" * 60)
+            print(f"Total Return: {results.get('total_return', 'N/A')}")
+            print(f"CAGR: {results.get('cagr', 'N/A')}")
+            print(f"Max Drawdown: {results.get('max_drawdown', 'N/A')}")
+            print(f"Sharpe Ratio: {results.get('sharpe', 'N/A')}")
+            print(f"Total Trades: {results.get('total_trades', 'N/A')}")
+            print("=" * 60)
+
+    # ── Live trading mode ───────────────────────────────────────────────────
     else:
-        run_backtest(
-            strategies_config=strategies_config,
-            lot_size=args.lot_size,
-            max_positions=args.max_positions,
-            start_date=args.start,
-            end_date=args.end,
+        print("=" * 60)
+        print("Combined Portfolio Strategy - LIVE TRADING")
+        print("=" * 60)
+        print(f"Strategy: {STRATEGY_NAME} v{STRATEGY_VERSION}")
+        print(f"Strategies: Gap Fade + Momentum Breakout")
+        print("=" * 60)
+
+        from lumibot.data_sources import QMTBridgeData
+        from lumibot.brokers import QMTBridgeBroker
+        from lumibot.traders import Trader
+
+        data_source = QMTBridgeData(QMT_BRIDGE_CONFIG)
+        broker = QMTBridgeBroker(QMT_BRIDGE_CONFIG, data_source=data_source, connect_stream=True)
+
+        strategy = CombinedPortfolioStrategy(
+            broker=broker,
+            parameters={
+                "strategies_config": strategies_config,
+                "lot_size": 100,
+                "max_positions": 12,
+            },
         )
+
+        trader = Trader(backtest=False)
+        trader.add_strategy(strategy)
+        print("\nStarting live trading... (Ctrl+C to stop)")
+        trader.run_all()
