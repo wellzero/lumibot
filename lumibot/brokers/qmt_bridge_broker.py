@@ -221,34 +221,34 @@ class QMTBridgeBroker(Broker):
             price_type = PRICE_TYPE_LIMIT
             price = float(order.limit_price) if order.limit_price else 0.0
 
-        # try:
-        #     result = client.place_order(
-        #         stock_code=symbol,
-        #         order_type=qmt_order_type,
-        #         order_volume=int(order.quantity),
-        #         price_type=price_type,
-        #         price=price,
-        #         strategy_name=order.strategy or "",
-        #         order_remark=f"LumiBot-{order.identifier}",
-        #         account_id=self.account_id,
-        #     )
+        try:
+            result = client.place_order(
+                stock_code=symbol,
+                order_type=qmt_order_type,
+                order_volume=int(order.quantity),
+                price_type=price_type,
+                price=price,
+                strategy_name=order.strategy or "",
+                order_remark=f"strategy-{order.identifier}",
+                account_id=self.account_id,
+            )
 
-        #     # Check result
-        #     if result and "order_id" in result:
-        #         order.identifier = str(result["order_id"])
-        #         order.set_transmitted()
-        #         self.logger.info(
-        #             f"Order submitted: {order.side} {order.quantity} {symbol} "
-        #             f"@ {price} (ID: {order.identifier})"
-        #         )
-        #     else:
-        #         error_msg = result.get("error", "Unknown error") if result else "No response"
-        #         order.set_error(f"Order submission failed: {error_msg}")
-        #         self.logger.error(f"Order submission failed: {error_msg}")
+            # Check result
+            if result and "order_id" in result:
+                order.identifier = str(result["order_id"])
+                order.set_transmitted()
+                self.logger.info(
+                    f"Order submitted: {order.side} {order.quantity} {symbol} "
+                    f"@ {price} (ID: {order.identifier})"
+                )
+            else:
+                error_msg = result.get("error", "Unknown error") if result else "No response"
+                order.set_error(f"Order submission failed: {error_msg}")
+                self.logger.error(f"Order submission failed: {error_msg}")
 
-        # except Exception as e:
-        #     order.set_error(f"Exception during order submission: {e}")
-        #     self.logger.error(f"Exception during order submission: {e}")
+        except Exception as e:
+            order.set_error(f"Exception during order submission: {e}")
+            self.logger.error(f"Exception during order submission: {e}")
 
         return order
 
