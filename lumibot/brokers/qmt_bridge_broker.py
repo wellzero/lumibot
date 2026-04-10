@@ -236,7 +236,7 @@ class QMTBridgeBroker(Broker):
             # Check result
             if result and "order_id" in result:
                 order.identifier = str(result["order_id"])
-                order.set_transmitted()
+                order.update_raw(result)
                 self.logger.info(
                     f"Order submitted: {order.side} {order.quantity} {symbol} "
                     f"@ {price} (ID: {order.identifier})"
