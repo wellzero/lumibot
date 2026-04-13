@@ -114,6 +114,26 @@ def qmt_bridge_normalize_symbol(symbol: str) -> str:
         # Default to Shenzhen
         return f"{symbol}.SZ"
 
+
+def qmt_bridge_denormalize_symbol(qmt_symbol: str) -> str:
+    """Convert QMT format (xxxxxx.SH / xxxxxx.SZ) to lumibot format (SHxxxxxx / SZxxxxxx).
+
+    Parameters
+    ----------
+    qmt_symbol : str
+        Symbol in QMT format, e.g. ``"600519.SH"``, ``"000001.SZ"``.
+
+    Returns
+    -------
+    str
+        Symbol in lumibot format, e.g. ``"SH600519"``, ``"SZ000001"``.
+        If no ``.`` is present the input is returned unchanged.
+    """
+    if "." not in qmt_symbol:
+        return qmt_symbol
+    code, exchange = qmt_symbol.rsplit(".", 1)
+    return f"{exchange}{code}"
+
 # QMT Bridge timestep mapping
 # Maps LumiBot timestep names to QMT period strings
 QMT_TIMESTEP_MAPPING = [

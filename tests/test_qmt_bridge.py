@@ -327,7 +327,7 @@ class TestQMTBridgeBroker:
         )
 
         assert position is not None
-        assert position.asset.symbol == "000001"
+        assert position.asset.symbol == "SZ000001"
         assert position.quantity == Decimal("1000")
 
     def test_parse_broker_order(self, qmt_bridge_broker, sample_order_data):
@@ -384,6 +384,84 @@ class TestQMTBridgeBroker:
 
         assert len(positions) == 1
         assert positions[0].quantity == Decimal("1000")
+
+    def test_pull_positions_empty(self, qmt_bridge_broker, mock_qmt_client):
+        """Test pulling positions when no positions held."""
+        mock_qmt_client.query_positions.return_value = {"data": []}
+
+        positions = qmt_bridge_broker._pull_positions(strategy=MagicMock())
+
+        assert positions == []
+
+    def test_pull_positions_error(self, qmt_bridge_broker, mock_qmt_client):
+        """Test pulling positions when broker raises an error."""
+        mock_qmt_client.query_positions.side_effect = Exception("Connection lost")
+
+        positions = qmt_bridge_broker._pull_positions(strategy=MagicMock())
+
+        assert positions == []
+
+    def test_pull_positions_filters_zero_quantity(self, qmt_bridge_broker, mock_qmt_client):
+        """Test that positions with zero quantity are filtered out."""
+        mock_qmt_client.query_positions.return_value = {
+            "data": [
+                {"stock_code": "000001.SZ", "volume": 1000, "cost_price": 12.50},
+                {"stock_code": "600519.SH", "volume": 0, "cost_price": 1800.00},
+            ]
+        }
+
+        positions = qmt_bridge_broker._pull_positions(strategy=MagicMock())
+
+        assert len(positions) == 1
+        assert positions[0].asset.symbol == "SZ000001"
+    def test_pull_position_single(self, qmt_bridge_broker, mock_qmt_client, sample_asset, sample_position_data):
+        """Test pulling a single position by asset."""
+        mock_qmt_client.query_single_position.return_value = {
+            "data": sample_position_data
+        }
+
+        position = qmt_bridge_broker._pull_position(strategy=MagicMock(), asset=sample_asset)
+
+        assert position is not None
+        assert position.asset.symbol == "SZ000001"
+        assert position.quantity == Decimal("1000")
+        mock_qmt_client.query_single_position.assert_called_once_with(
+            stock_code="000001.SZ",
+            account_id="12345678",
+        )
+
+    def test_pull_position_single_not_found(self, qmt_bridge_broker, mock_qmt_client, sample_asset):
+        """Test pulling a single position when asset has no position."""
+        mock_qmt_client.query_single_position.return_value = {"data": None}
+
+        position = qmt_bridge_broker._pull_position(strategy=MagicMock(), asset=sample_asset)
+
+        assert position is None
+
+    def test_pull_position_single_error(self, qmt_bridge_broker, mock_qmt_client, sample_asset):
+        """Test pulling a single position when broker raises an error."""
+        mock_qmt_client.query_single_position.side_effect = Exception("Timeout")
+
+        position = qmt_bridge_broker._pull_position(strategy=MagicMock(), asset=sample_asset)
+
+        assert position is None
+
+    def test_pull_positions_multiple(self, qmt_bridge_broker, mock_qmt_client):
+        """Test pulling multiple positions across different exchanges."""
+        mock_qmt_client.query_positions.return_value = {
+            "data": [
+                {"stock_code": "000001.SZ", "volume": 1000, "cost_price": 12.50, "market_value": 12500.00},
+                {"stock_code": "600519.SH", "volume": 100, "cost_price": 1800.00, "market_value": 180000.00},
+                {"stock_code": "300750.SZ", "volume": 500, "cost_price": 200.00, "market_value": 100000.00},
+            ]
+        }
+
+        positions = qmt_bridge_broker._pull_positions(strategy=MagicMock())
+
+        assert len(positions) == 3
+        symbols = {p.asset.symbol for p in positions}
+        assert symbols == {"SZ000001", "SH600519", "SZ300750"}
+        assert positions[1].market_value == Decimal("180000.00")
 
 
 # ==================== Integration Tests ====================

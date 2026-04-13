@@ -35,7 +35,7 @@ from typing import Union
 from lumibot.brokers.broker import Broker
 from lumibot.entities import Asset, Order, Position
 from lumibot.tools.lumibot_logger import get_logger
-from lumibot.data_sources.qmt_bridge_data import qmt_bridge_normalize_symbol
+from lumibot.data_sources.qmt_bridge_data import qmt_bridge_normalize_symbol, qmt_bridge_denormalize_symbol
 
 logger = get_logger(__name__)
 
@@ -410,12 +410,12 @@ class QMTBridgeBroker(Broker):
             return None
 
         try:
-            # Extract symbol
+            # Convert QMT format (xxxxxx.SH / xxxxxx.SZ) to lumibot format
+            # (SHxxxxxx / SZxxxxxx) so that Asset equality matches what
+            # create_order() stores via _sanitize_user_asset.
+            # Strategies use "SH600519"/"SZ000001" format throughout.
             stock_code = pos_data.get("stock_code", "")
-            if "." in stock_code:
-                symbol = stock_code.split(".")[0]
-            else:
-                symbol = stock_code
+            symbol = qmt_bridge_denormalize_symbol(stock_code)
 
             # Create asset
             asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
@@ -520,12 +520,10 @@ class QMTBridgeBroker(Broker):
             return None
 
         try:
-            # Extract symbol
+            # Convert QMT format (xxxxxx.SH / xxxxxx.SZ) to lumibot format
+            # (SHxxxxxx / SZxxxxxx) for consistency with strategy symbols.
             stock_code = response.get("stock_code", "")
-            if "." in stock_code:
-                symbol = stock_code.split(".")[0]
-            else:
-                symbol = stock_code
+            symbol = qmt_bridge_denormalize_symbol(stock_code)
 
             # Create asset
             asset = Asset(symbol=symbol, asset_type=Asset.AssetType.STOCK)
