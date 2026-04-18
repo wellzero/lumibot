@@ -1867,13 +1867,15 @@ class BacktestingBroker(Broker):
 
         for trading_fee in trading_fees:
             if trading_fee.taker is True and order_type_value in {"market", "stop"}:
-                trade_cost += trading_fee.flat_fee
-                trade_cost += Decimal(str(price)) * Decimal(str(order.quantity)) * trading_fee.percent_fee
-                trade_cost += Decimal(str(order.quantity)) * trading_fee.per_contract_fee
+                raw = (trading_fee.flat_fee
+                       + Decimal(str(price)) * Decimal(str(order.quantity)) * trading_fee.percent_fee
+                       + Decimal(str(order.quantity)) * trading_fee.per_contract_fee)
+                trade_cost += max(raw, trading_fee.min_fee)
             elif trading_fee.maker is True and order_type_value in {"limit", "stop_limit", "smart_limit"}:
-                trade_cost += trading_fee.flat_fee
-                trade_cost += Decimal(str(price)) * Decimal(str(order.quantity)) * trading_fee.percent_fee
-                trade_cost += Decimal(str(order.quantity)) * trading_fee.per_contract_fee
+                raw = (trading_fee.flat_fee
+                       + Decimal(str(price)) * Decimal(str(order.quantity)) * trading_fee.percent_fee
+                       + Decimal(str(order.quantity)) * trading_fee.per_contract_fee)
+                trade_cost += max(raw, trading_fee.min_fee)
 
         return trade_cost
         

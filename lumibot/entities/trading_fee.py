@@ -4,7 +4,7 @@ from decimal import Decimal
 class TradingFee:
     """TradingFee class. Used to define the trading fees for a broker in a strategy/backtesting."""
 
-    def __init__(self, flat_fee=0.0, percent_fee=0.0, per_contract_fee=0.0, maker=True, taker=True):
+    def __init__(self, flat_fee=0.0, percent_fee=0.0, per_contract_fee=0.0, min_fee=0.0, maker=True, taker=True):
         """
         Parameters
         ----------
@@ -16,6 +16,10 @@ class TradingFee:
             Fee charged per contract (multiplied by order quantity). Useful for options commissions
             where brokers charge per contract (e.g., $0.65/contract). For a 40-contract order with
             per_contract_fee=0.65, the total fee would be $26.00.
+        min_fee : Decimal, float, or None
+            Minimum fee floor. The total of flat_fee + percent_fee * value + per_contract_fee * qty
+            will be raised to at least min_fee if min_fee > 0. Useful for markets with minimum
+            commission rules (e.g., China A-share: max(0.05% * trade_value, 5 CNY)).
         maker : bool
             Whether this fee is a maker fee (applies to limit orders).
             Default is True, which means that this fee will be used on limit orders.
@@ -35,6 +39,7 @@ class TradingFee:
         >>> trading_fee_1 = TradingFee(flat_fee=5.2) # $5.20 flat fee per order
         >>> trading_fee_2 = TradingFee(percent_fee=0.01) # 1% fee
         >>> trading_fee_3 = TradingFee(per_contract_fee=0.65) # $0.65 per contract
+        >>> trading_fee_4 = TradingFee(percent_fee=0.0005, min_fee=5.0) # China A-share: max(0.05%, 5 CNY)
         >>> backtesting_start = datetime(2022, 1, 1)
         >>> backtesting_end = datetime(2022, 6, 1)
         >>> result = MyStrategy.backtest(
@@ -47,5 +52,6 @@ class TradingFee:
         self.flat_fee = Decimal(str(flat_fee))
         self.percent_fee = Decimal(str(percent_fee))
         self.per_contract_fee = Decimal(str(per_contract_fee))
+        self.min_fee = Decimal(str(min_fee))
         self.maker = maker
         self.taker = taker
