@@ -1048,6 +1048,7 @@ class StrategyExecutor(Thread):
         try:
             # Variable Restore
             self.strategy.load_variables_from_db()
+            self.strategy.load_state_from_json()
             on_trading_iteration()
 
             self.strategy._first_iteration = False
@@ -1065,6 +1066,7 @@ class StrategyExecutor(Thread):
             # Variable Backup
             self._in_trading_iteration = False
             self.strategy.backup_variables_to_db()
+            self.strategy.save_state_to_json()
 
             # Update cron count to account for how long this iteration took to complete so that the next iteration will
             # occur at the correct time.
@@ -1181,6 +1183,7 @@ class StrategyExecutor(Thread):
                 self.check_queue_thread.join(timeout=5.0)
 
         self.strategy.backup_variables_to_db()
+        self.strategy.save_state_to_json()
 
     def __del__(self):
         """Destructor to ensure scheduler is shut down when executor is garbage collected"""

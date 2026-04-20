@@ -5,6 +5,7 @@ import math
 import os
 import random
 import string
+import sys
 import time
 import traceback
 import uuid
@@ -603,6 +604,16 @@ class _Strategy:
         self._last_backup_state = None
         self.vars = Vars()
         self.agents = AgentManager(self)
+
+        # JSON state file persistence (works in both backtest + live, no database needed)
+        # State file saved alongside the strategy script: {script_dir}/{name}_state_backtest.json
+        _json_state_dir = os.environ.get("LUMIBOT_STATE_DIR", "")
+        if not _json_state_dir:
+            _script_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv else "."
+            _json_state_dir = _script_dir
+        self._json_state_dir = _json_state_dir
+        self._json_state_file = None  # Resolved lazily on first save/load
+        self._last_json_state = None
 
         # Storing parameters for the initialize method
         if not hasattr(self, "parameters") or not isinstance(self.parameters, dict) or self.parameters is None:
@@ -3849,6 +3860,92 @@ class _Strategy:
     
         except Exception as e:
             self.logger.error(f"Error loading variables from database: {e}", exc_info=True)
+
+    def _resolve_json_state_file(self):
+        """Resolve JSON state file path based on backtest vs live mode."""
+        if self._json_state_file is not None:
+            return self._json_state_file
+        suffix = "_backtest" if self.is_backtesting else "_live_trade"
+        self._json_state_file = f"{self._json_state_dir}/{self._name}_state{suffix}.json"
+        return self._json_state_file
+
+    def save_state_to_json(self):
+        """Save self.vars to a JSON file (works in both backtest and live mode).
+
+        Automatically called by StrategyExecutor after each on_trading_iteration.
+        Uses SafeJSONEncoder for datetime/Decimal/set serialization.
+        Only writes when state has changed to avoid unnecessary I/O.
+        Backtest: {state_dir}/{name}_state_backtest.json
+        Live:     {state_dir}/{name}_state_live_trade.json
+        """
+        data = self.vars.all()
+        if not data:
+            return
+
+        try:
+            state_file = self._resolve_json_state_file()
+            current_state = json.dumps(data, sort_keys=True, cls=SafeJSONEncoder)
+            if current_state == self._last_json_state:
+                return
+
+            os.makedirs(os.path.dirname(state_file), exist_ok=True)
+            with open(state_file, 'w', encoding='utf-8') as f:
+                f.write(current_state)
+
+            self._last_json_state = current_state
+            self.logger.debug(f"State saved to {state_file}")
+        except Exception as e:
+            self.logger.debug(f"Error saving state to JSON: {e}")
+
+    def load_state_from_json(self):
+        """Load self.vars from a JSON file (works in both backtest and live mode).
+
+        Automatically called by StrategyExecutor before each on_trading_iteration.
+        Restores previously saved variables so strategy can resume after Ctrl+C / restart.
+        Backtest: {state_dir}/{name}_state_backtest.json
+        Live:     {state_dir}/{name}_state_live_trade.json
+        """
+        state_file = self._resolve_json_state_file()
+        if not os.path.exists(state_file):
+            return
+
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                json_data = f.read()
+
+            if not json_data.strip():
+                return
+
+            # Reuse ISO datetime coercion from load_variables_from_db
+            import re
+            iso_dt_re = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+            iso_date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+            def _coerce_value(v):
+                if not isinstance(v, str):
+                    return v
+                if iso_dt_re.match(v):
+                    try:
+                        v2 = v.replace("Z", "+00:00") if v.endswith("Z") else v
+                        return datetime.datetime.fromisoformat(v2)
+                    except Exception:
+                        return v
+                if iso_date_re.match(v):
+                    try:
+                        return datetime.datetime.strptime(v, "%Y-%m-%d").date()
+                    except Exception:
+                        return v
+                return v
+
+            data = json.loads(json_data, object_hook=lambda d: {k: _coerce_value(v) for k, v in d.items()})
+
+            for key, value in data.items():
+                self.vars.set(key, value)
+
+            self._last_json_state = json.dumps(data, sort_keys=True, cls=SafeJSONEncoder)
+            self.logger.debug(f"State loaded from {state_file}: {len(data)} keys")
+        except Exception as e:
+            self.logger.debug(f"Error loading state from JSON: {e}")
 
     def calculate_returns(self):
         # Check if we are in backtesting mode, if so, don't send the message
