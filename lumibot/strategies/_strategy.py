@@ -3862,22 +3862,24 @@ class _Strategy:
             self.logger.error(f"Error loading variables from database: {e}", exc_info=True)
 
     def _resolve_json_state_file(self):
-        """Resolve JSON state file path based on backtest vs live mode."""
+        """Resolve JSON state file path (live trading only)."""
         if self._json_state_file is not None:
             return self._json_state_file
-        suffix = "_backtest" if self.is_backtesting else "_live_trade"
-        self._json_state_file = f"{self._json_state_dir}/{self._name}_state{suffix}.json"
+        self._json_state_file = f"{self._json_state_dir}/{self._name}_state_live_trade.json"
         return self._json_state_file
 
     def save_state_to_json(self):
-        """Save self.vars to a JSON file (works in both backtest and live mode).
+        """Save self.vars to a JSON file (live trading only).
 
         Automatically called by StrategyExecutor after each on_trading_iteration.
+        Skipped during backtesting — only persists state in live mode.
         Uses SafeJSONEncoder for datetime/Decimal/set serialization.
         Only writes when state has changed to avoid unnecessary I/O.
-        Backtest: {state_dir}/{name}_state_backtest.json
-        Live:     {state_dir}/{name}_state_live_trade.json
+        Live: {state_dir}/{name}_state_live_trade.json
         """
+        if self.is_backtesting:
+            return
+
         data = self.vars.all()
         if not data:
             return
@@ -3898,13 +3900,16 @@ class _Strategy:
             self.logger.debug(f"Error saving state to JSON: {e}")
 
     def load_state_from_json(self):
-        """Load self.vars from a JSON file (works in both backtest and live mode).
+        """Load self.vars from a JSON file (live trading only).
 
         Automatically called by StrategyExecutor before each on_trading_iteration.
+        Skipped during backtesting — only restores state in live mode.
         Restores previously saved variables so strategy can resume after Ctrl+C / restart.
-        Backtest: {state_dir}/{name}_state_backtest.json
-        Live:     {state_dir}/{name}_state_live_trade.json
+        Live: {state_dir}/{name}_state_live_trade.json
         """
+        if self.is_backtesting:
+            return
+
         state_file = self._resolve_json_state_file()
         if not os.path.exists(state_file):
             return
