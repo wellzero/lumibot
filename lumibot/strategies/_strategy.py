@@ -2122,7 +2122,7 @@ class _Strategy:
                     except Exception:
                         local_df = None
 
-                if is not None and not local_df.empty and "close" in local_df.columns:
+                if local_df is not None and not local_df.empty and "close" in local_df.columns:
                     df = local_df.copy()
                     df["return"] = df["close"].pct_change(fill_method=None)
                     df["symbol_cumprod"] = (1 + df["return"]).cumprod()
