@@ -2096,25 +2096,51 @@ class _Strategy:
                     df["symbol_cumprod"] = (1 + df["return"]).cumprod()
                 self._benchmark_returns_df = df
 
-            # If we are using any other data source, then get the benchmark returns from yahoo
+            # For all other data sources, try local data first, then fall back to Yahoo
             else:
                 benchmark_asset = self._benchmark_asset
 
-                # If the benchmark asset is a string, then just use the string as the symbol
+                # Normalize to Asset object
                 if isinstance(benchmark_asset, str):
-                    benchmark_symbol = benchmark_asset
-                # If the benchmark asset is an Asset object, then use the symbol of the asset
-                elif isinstance(benchmark_asset, Asset):
-                    benchmark_symbol = benchmark_asset.symbol
-                # If the benchmark asset is a tuple, then use the symbols of the assets in the tuple
+                    benchmark_asset = Asset(symbol=benchmark_asset, asset_type="stock")
                 elif isinstance(benchmark_asset, tuple):
-                    benchmark_symbol = f"{benchmark_asset[0].symbol}/{benchmark_asset[1].symbol}"
+                    benchmark_asset = (
+                        Asset(symbol=benchmark_asset[0].symbol, asset_type="crypto"),
+                        Asset(symbol=benchmark_asset[1].symbol, asset_type="forex"),
+                    )
 
-                self._benchmark_returns_df = get_symbol_returns(
-                    benchmark_symbol,
-                    self._backtesting_start,
-                    backtesting_end_adjusted,
-                )
+                local_df = None
+                ds = self.broker.data_source
+                if hasattr(ds, "_pull_source_symbol_bars_between_dates"):
+                    try:
+                        local_df = ds._pull_source_symbol_bars_between_dates(
+                            asset=benchmark_asset,
+                            timestep="day",
+                            start_date=self._backtesting_start,
+                            end_date=backtesting_end_adjusted,
+                        )
+                    except Exception:
+                        local_df = None
+
+                if is not None and not local_df.empty and "close" in local_df.columns:
+                    df = local_df.copy()
+                    df["return"] = df["close"].pct_change(fill_method=None)
+                    df["symbol_cumprod"] = (1 + df["return"]).cumprod()
+                    self._benchmark_returns_df = df
+                else:
+                    # Fall back to Yahoo Finance
+                    if isinstance(benchmark_asset, Asset):
+                        benchmark_symbol = benchmark_asset.symbol
+                    elif isinstance(benchmark_asset, tuple):
+                        benchmark_symbol = f"{benchmark_asset[0].symbol}/{benchmark_asset[1].symbol}"
+                    else:
+                        benchmark_symbol = str(benchmark_asset)
+
+                    self._benchmark_returns_df = get_symbol_returns(
+                        benchmark_symbol,
+                        self._backtesting_start,
+                        backtesting_end_adjusted,
+                    )
 
     def plot_returns_vs_benchmark(
         self,
