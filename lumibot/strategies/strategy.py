@@ -301,7 +301,7 @@ class Strategy(_Strategy):
 
         self.update_broker_balances(force_update=False)
 
-        cash_position = self.get_position(self.quote_asset)
+        cash_position = self._get_cash_position()
         quantity = cash_position.quantity if cash_position else None
 
         # This is not really true:
@@ -1398,15 +1398,28 @@ class Strategy(_Strategy):
 
         """
         include_cash = include_cash_positions or self.include_cash_positions
+        filled_positions = getattr(self.broker, "_filled_positions", None)
+        filled_positions_revision = getattr(filled_positions, "revision", 0)
+        quote_asset = self.quote_asset
+        cache_key = (filled_positions_revision, include_cash, quote_asset)
+        cached = getattr(self, "_positions_cache", {}).get(cache_key) if hasattr(self, "_positions_cache") else None
+        if cached is not None:
+            return list(cached)
+
         tracked_positions = self.broker.get_tracked_positions(self.name)
+        if include_cash:
+            result = list(tracked_positions)
+        else:
+            result = [position for position in tracked_positions if position.asset != quote_asset]
 
-        # Remove the quote asset from the positions list if it is there
-        clean_positions = []
-        for position in tracked_positions:
-            if position.asset != self.quote_asset or include_cash:
-                clean_positions.append(position)
-
-        return clean_positions
+        cache = getattr(self, "_positions_cache", None)
+        if cache is None:
+            cache = {}
+            self._positions_cache = cache
+        # Single-entry cache: keep only the latest revision/parameter combination to avoid stale results.
+        cache.clear()
+        cache[cache_key] = tuple(result)
+        return list(result)
 
     def get_historical_bot_stats(self):
         """Get the historical account value.
@@ -2467,30 +2480,121 @@ class Strategy(_Strategy):
         else:
             quote_asset = quote
 
+        is_backtesting_run = bool(
+            IS_BACKTESTING
+            or getattr(self, "is_backtesting", False)
+            or getattr(getattr(self, "broker", None), "IS_BACKTESTING_BROKER", False)
+        )
+        if is_backtesting_run:
+            current_datetime = getattr(getattr(self, "broker", None), "datetime", None)
+            cache = getattr(self, "_last_price_request_cache", None)
+            if cache is None:
+                cache = {}
+                self._last_price_request_cache = cache
+                self._last_price_request_cache_datetime = current_datetime
+            elif getattr(self, "_last_price_request_cache_datetime", None) != current_datetime:
+                cache.clear()
+                self._last_price_request_cache_datetime = current_datetime
+            cache_key = (asset, quote_asset, exchange)
+            if cache_key in cache:
+                return cache[cache_key]
+
         try:
             # For daily-cadence backtests, prefer day bars for sources where minute-level
             # fetches are expensive (ThetaData/IBKR/routed backtesting). Keep Yahoo/Polygon
             # on legacy behavior to preserve existing regression anchors.
-            is_backtesting_run = bool(
-                IS_BACKTESTING
-                or getattr(self, "is_backtesting", False)
-                or getattr(getattr(self, "broker", None), "IS_BACKTESTING_BROKER", False)
-            )
+            #
+            # 🚨 CRITICAL — sim-time safety invariant:
+            # This shortcut MUST request exactly the bar AT (or the last completed bar before)
+            # the simulation time — never a bar after it. In backtests the full history exists
+            # ahead of the sim clock, so any call that reaches into the future is look-ahead
+            # bias and will silently leak future prices into position sizing / last-price reads.
+            #
+            # Why `length=1` (no timeshift, no length=2):
+            # `Data.get_bars(dt, length, timestep="day", timeshift=0)` returns rows in the closed
+            # interval `[iter_count - (length - 1), iter_count]` where `iter_count` is the index
+            # of the last bar whose timestamp is ≤ `dt` (see `Data.get_iter_count` —
+            # `searchsorted(side="right") - 1`). With `length=1, timeshift=0` the slice is the
+            # single bar at `iter_count`, guaranteed to be at or before sim_time.
+            #
+            # The earlier `length=2, timeshift=-1` call produced `slice(iter_count, iter_count+2)`,
+            # i.e. `[bar-at-sim-time, next-bar-after-sim-time]`, and then read `iloc[-1]` —
+            # returning the NEXT bar's close. When the underlying frame also contained bars past
+            # the backtest window (e.g. a shared S3 cache row stamped at wall-clock "today"),
+            # that next-bar was real-now's market close. Observed 2026-04-17 on an Alpha Picks
+            # IBKR backtest: `get_last_price(COP, sim_time=2022-07-01)` returned $97.43 (today's
+            # close) instead of the 2022-07-01 close of $90.98, polluting position sizing.
+            # Regression coverage lives in `tests/test_get_last_price_sim_time_safety.py` and
+            # explicitly replays a polluted frame so this exact failure mode cannot re-land.
             should_use_daily = self._should_use_daily_last_price(asset)
             if is_backtesting_run and should_use_daily and self._supports_daily_last_price_optimization():
                 try:
-                    bars = self.get_historical_prices(asset, length=2, timestep="day", timeshift=-1, quote=quote_asset, exchange=exchange)
+                    bars = self.get_historical_prices(
+                        asset,
+                        length=1,
+                        timestep="day",
+                        quote=quote_asset,
+                        exchange=exchange,
+                    )
                     if bars is not None and getattr(bars, "df", None) is not None and not bars.df.empty:
-                        return float(bars.df["close"].iloc[-1])
+                        result = float(bars.df["close"].iloc[-1])
+                        cache[cache_key] = result
+                        return result
+
+                    # Forward-fill retry (v4.5.1): when the length=1 slice comes
+                    # back empty (observed on 24/7-market midnight iterations —
+                    # no day bar exists exactly at sim_time=00:00), request a
+                    # small window ending at sim_time and return the close of
+                    # the last row with index <= sim_time. Without this, the
+                    # shortcut returns None → broker fallback also returns
+                    # None → strategy skips every order for the entire run
+                    # (observed on Alpha Picks 24/7 local BT: 31 simulated
+                    # days at Val: $100,000 with zero trades). Semantic: "if
+                    # we have no bar at sim_time, the price hasn't changed
+                    # since the last known bar" — matches how mark-to-market
+                    # works elsewhere. No guard layered here; this ONLY
+                    # triggers on an honestly-empty length=1 result.
+                    sim_dt = getattr(getattr(self, "broker", None), "datetime", None)
+                    if sim_dt is not None:
+                        bars_ff = self.get_historical_prices(
+                            asset,
+                            length=5,
+                            timestep="day",
+                            quote=quote_asset,
+                            exchange=exchange,
+                        )
+                        if (
+                            bars_ff is not None
+                            and getattr(bars_ff, "df", None) is not None
+                            and not bars_ff.df.empty
+                        ):
+                            try:
+                                df_ff = bars_ff.df
+                                idx = df_ff.index
+                                sim_cmp = pd.Timestamp(sim_dt)
+                                if getattr(idx, "tz", None) is not None and sim_cmp.tzinfo is None:
+                                    sim_cmp = sim_cmp.tz_localize(idx.tz)
+                                elif getattr(idx, "tz", None) is None and sim_cmp.tzinfo is not None:
+                                    sim_cmp = sim_cmp.tz_localize(None)
+                                pre_sim = df_ff[idx <= sim_cmp]
+                                if not pre_sim.empty:
+                                    result = float(pre_sim["close"].iloc[-1])
+                                    cache[cache_key] = result
+                                    return result
+                            except Exception:
+                                pass
                 except Exception:
                     # Fall through to the default path on any failure.
                     pass
-            return self.broker.get_last_price(
+            result = self.broker.get_last_price(
                 asset,
                 quote=quote_asset,
                 exchange=exchange,
                 # should_use_last_close=should_use_last_close,
             )
+            if is_backtesting_run:
+                cache[cache_key] = result
+            return result
         except Exception as e:
             self.log_message(f"Could not get last price for {asset}", color="red")
             self.log_message(f"{e}")
@@ -2538,8 +2642,14 @@ class Strategy(_Strategy):
         value = getattr(self, "_sleeptime", None)
         if value is None:
             return None
+        cached_input = getattr(self, "_sleeptime_seconds_cache_input", object())
+        if value == cached_input:
+            return getattr(self, "_sleeptime_seconds_cache_value", None)
         if isinstance(value, (int, float)):
-            return float(value) * 60.0
+            result = float(value) * 60.0
+            self._sleeptime_seconds_cache_input = value
+            self._sleeptime_seconds_cache_value = result
+            return result
         if isinstance(value, str):
             normalized = value.strip().upper().replace(" ", "")
             if not normalized:
@@ -2557,7 +2667,10 @@ class Strategy(_Strategy):
                 multiplier = 86400.0
             else:
                 multiplier = 60.0
-            return qty * multiplier
+            result = qty * multiplier
+            self._sleeptime_seconds_cache_input = value
+            self._sleeptime_seconds_cache_value = result
+            return result
         return None
 
     def get_quote(self, asset: Asset, quote: Asset = None, exchange: str = None) -> Quote:
@@ -5496,6 +5609,55 @@ class Strategy(_Strategy):
         >>>     benchmark_asset=benchmark_asset,
         >>> )
         """
+        # Environment-variable override for start/end dates.
+        #
+        # Why: strategies frequently hardcode `backtesting_start` / `backtesting_end`
+        # in their `if __name__ == "__main__":` block for local dev convenience.
+        # When the same code is run in a managed container (bot_manager backtest
+        # ECS task, etc.), the orchestrator wants the caller's requested date
+        # range to win — otherwise MCP `start_backtest(startDate, endDate)` has
+        # no teeth and every run uses whatever the author pinned in the file.
+        #
+        # Precedence: env var > passed argument. The env vars are set by the
+        # infrastructure (bot_manager copies `start_date`/`end_date` from the
+        # job payload into `BACKTESTING_START` / `BACKTESTING_END`), so they
+        # represent the caller's current intent. Local runs with no env var
+        # set continue to use the hardcoded datetime as before.
+        #
+        # Accepted formats: ISO date (`YYYY-MM-DD`) or full ISO datetime. Any
+        # parse failure is logged and the passed-in value is kept — we never
+        # silently fall back to "now" or the epoch.
+        env_start = os.environ.get("BACKTESTING_START")
+        env_end = os.environ.get("BACKTESTING_END")
+        if env_start:
+            try:
+                parsed_start = datetime.datetime.fromisoformat(env_start)
+                if parsed_start != backtesting_start:
+                    # WARNING (not INFO): silent truncation of a strategy's
+                    # hardcoded backtest window from a stale .env value is
+                    # easy to miss and produces "mystery" result drift. Flag
+                    # it loudly so the override is visible in every run.
+                    logging.warning(
+                        f"BACKTESTING_START env var override: {backtesting_start} -> {parsed_start}"
+                    )
+                backtesting_start = parsed_start
+            except (TypeError, ValueError) as exc:
+                logging.warning(
+                    f"Ignoring unparseable BACKTESTING_START={env_start!r}: {exc}"
+                )
+        if env_end:
+            try:
+                parsed_end = datetime.datetime.fromisoformat(env_end)
+                if parsed_end != backtesting_end:
+                    logging.warning(
+                        f"BACKTESTING_END env var override: {backtesting_end} -> {parsed_end}"
+                    )
+                backtesting_end = parsed_end
+            except (TypeError, ValueError) as exc:
+                logging.warning(
+                    f"Ignoring unparseable BACKTESTING_END={env_end!r}: {exc}"
+                )
+
         results, strategy = self.run_backtest(
             datasource_class=datasource_class,
             backtesting_start=backtesting_start,

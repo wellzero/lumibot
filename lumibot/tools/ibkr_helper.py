@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -14,13 +14,12 @@ import pandas as pd
 from lumibot.constants import LUMIBOT_CACHE_FOLDER, LUMIBOT_DEFAULT_PYTZ
 from lumibot.entities import Asset
 from lumibot.tools.backtest_cache import CacheMode, get_backtest_cache
+from lumibot.tools.data_downloader_queue_client import queue_request
 from lumibot.tools.ibkr_secdef import (
-    IBKR_US_FUTURES_EXCHANGES,
     IbkrFuturesExchangeAmbiguousError,
     select_futures_exchange_from_secdef_search_payload,
 )
 from lumibot.tools.parquet_series_cache import ParquetSeriesCache
-from lumibot.tools.data_downloader_queue_client import queue_request
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +31,33 @@ IBKR_DEFAULT_CRYPTO_VENUE = "ZEROHASH"
 IBKR_DEFAULT_HISTORY_SOURCE = "Trades"
 IBKR_DEFAULT_FUTURES_EXCHANGE_FALLBACK = "CME"
 IBKR_DEFAULT_INDEX_HISTORY_SOURCE = "Midpoint"
-IBKR_STOCK_INDEX_DAILY_MAX_PERIOD = "180d"
+# Per-request period cap for daily stock/index history.
+#
+# Rationale: IBKR Client Portal Gateway caps daily-history responses at ~1000
+# data points per call (``IBKR_HISTORY_MAX_POINTS``). Live testing against the
+# production gateway on 2026-04-17 showed that ``period=5y`` already hits that
+# ceiling (1000 bars returned, covering ~4 trading years), while ``period=2y``
+# returned 323 bars and ``period=180d`` (the prior value) returned only ~125
+# bars. Asking for less than the cap is pure inefficiency: multi-year
+# backtests would need 40+ round-trips per symbol, and in practice the loop
+# was completing after a single iteration (the initial fetch near real-now
+# filled the cache, then the coverage check skipped the real historical
+# window for every subsequent simulation date, resulting in flat "today"
+# prices for the entire historical range — observed in Peter Credit Spreads
+# backtest a83663bd where VIX was constant 14.2 across 2,010 simulated days
+# and max drawdown was ``-94%``).
+#
+# With ``5y``:
+#   - Each call returns up to 1000 bars (~4 years of daily data).
+#   - An 8-year backtest is covered in ~2 paginated chunks per symbol/source.
+#   - Short requests (e.g. "2 bars ending <date>") still receive a valid
+#     response because IBKR honours ``startTime`` and returns the N bars
+#     ending at that time, bounded by 1000.
+#
+# If a future need arises for sub-daily stock/index bars with very long
+# windows, extend ``_history_period_for_request`` to pick a smaller period
+# tailored to the bar size rather than tightening this cap.
+IBKR_STOCK_INDEX_DAILY_MAX_PERIOD = "5y"
 
 IBKR_CONID_NEGATIVE_CACHE_TTL_SECONDS = 24 * 60 * 60  # 24h (persisted via BacktestCacheManager when enabled)
 
@@ -220,6 +245,53 @@ def _record_negative_conid(*, key: str, reason: str, message: str) -> None:
         pass
 
 
+def _clear_negative_conid(*, key: str) -> None:
+    """Remove a stale negative conid marker after a later successful resolution."""
+    if not key:
+        return
+    _load_negative_conid_cache()
+    if key not in _NEGATIVE_CONID_CACHE:
+        return
+    _NEGATIVE_CONID_CACHE.pop(key, None)
+
+    path = _negative_conid_cache_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_NEGATIVE_CONID_CACHE, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        return
+    try:
+        cache_manager = get_backtest_cache()
+        cache_manager.on_local_update(path, payload={"provider": "ibkr", "type": "conids_negative"})
+    except Exception:
+        pass
+
+
+def _date_from_yyyymmdd(value: str) -> Optional[date]:
+    raw = str(value or "").strip()
+    if not (raw.isdigit() and len(raw) == 8):
+        return None
+    try:
+        return datetime.strptime(raw, "%Y%m%d").date()
+    except Exception:
+        return None
+
+
+def _expiration_date_only(value: Any) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+
+def _is_future_or_current_expiration(value: Any) -> bool:
+    expiration_date = _expiration_date_only(value)
+    if expiration_date is None:
+        return False
+    return expiration_date >= datetime.now(timezone.utc).date()
+
+
 def _resolve_futures_exchange(symbol: str) -> str:
     symbol_upper = str(symbol or "").strip().upper()
     if not symbol_upper:
@@ -333,6 +405,16 @@ def get_price_data(
     - optional S3 mirroring via BacktestCacheManager
     - best-effort negative caching via `missing=True` placeholder rows (only for true NO_DATA)
     """
+    # v4.5.1: defensive coercion. Callers occasionally hand us a bare string
+    # symbol (observed in Alpha Picks 2026-04-19 local backtest: upstream code
+    # path leaked a string through to this helper, producing misleading
+    # "IBKR history fetch failed for None/USD ...: 'str' object has no
+    # attribute 'symbol'" errors that obscured the real bug). Accepting a
+    # string here is a one-line safety net that lets the rest of the pipeline
+    # work, and the log message becomes accurate.
+    if isinstance(asset, str):
+        asset = Asset(symbol=asset)
+
     start_utc = _to_utc(start_dt)
     end_utc = _to_utc(end_dt)
     if start_utc > end_utc:
@@ -717,6 +799,33 @@ def get_price_data(
     if needs_fetch and _window_is_placeholder_covered(df_cache, start_local=start_local, end_local=end_local):
         needs_fetch = False
 
+    # Opt-in trace: log why we decided to hit the network, so we can audit measured-pass cache misses.
+    if needs_fetch and os.environ.get("LUMIBOT_CACHE_MISS_DEBUG"):
+        try:
+            logger.warning(
+                "[CACHE_MISS] %s %s ts=%s start_local=%s end_local=%s cov_start=%s cov_end=%s "
+                "win_cov_start=%s win_cov_end=%s win_empty=%s start_tol=%s end_tol=%s "
+                "win_start_gap_closed=%s win_end_gap_closed=%s cache_start_gap_closed=%s cache_end_gap_closed=%s",
+                getattr(asset, "symbol", None),
+                asset_type,
+                timestep,
+                start_local,
+                end_local,
+                coverage_start,
+                coverage_end,
+                window_cov_start,
+                window_cov_end,
+                bool(window_slice.empty) if coverage_start is not None else None,
+                start_tolerance,
+                end_tolerance,
+                window_start_gap_closed,
+                window_end_gap_closed,
+                cache_start_gap_closed,
+                cache_end_gap_closed,
+            )
+        except Exception:
+            pass
+
     if needs_fetch:
         segments: list[tuple[datetime, datetime]] = []
         if coverage_start is None or coverage_end is None or window_slice.empty:
@@ -917,7 +1026,8 @@ def get_price_data(
         if not covers_requested_window:
             logger.warning(
                 "IBKR cached history remained underfilled after refresh for %s/%s timestep=%s exchange=%s source=%s; "
-                "returning empty frame (placeholder_covered=%s)",
+                "returning available real bars instead of synthesizing an empty dataset "
+                "(placeholder_covered=%s)",
                 getattr(asset, "symbol", None),
                 getattr(quote, "symbol", None) if quote else None,
                 timestep,
@@ -925,7 +1035,6 @@ def get_price_data(
                 history_source,
                 placeholder_covered,
             )
-            return frame.iloc[0:0].copy()
     elif placeholder_covered:
         return frame
     return frame
@@ -1163,6 +1272,15 @@ def _resolve_cont_future_segments(*, asset: Asset, start_dt: datetime, end_dt: d
                 exc,
             )
             continue
+        resolved_expiration = _expiration_date_only(getattr(contract_asset, "_ibkr_resolved_expiration", None))
+        if resolved_expiration is not None and resolved_expiration != expiration:
+            logger.warning(
+                "IBKR roll segment %s computed expiration %s but IBKR lists %s; using listed expiration for history fetches.",
+                contract_symbol,
+                expiration,
+                resolved_expiration,
+            )
+            contract_asset = Asset(asset.symbol, asset_type=Asset.AssetType.FUTURE, expiration=resolved_expiration)
         segments.append((contract_asset, _to_utc(seg_start), _to_utc(seg_end)))
     return segments
 
@@ -1552,6 +1670,24 @@ def _fetch_history_between_dates(
     start_dt = _to_utc(start_dt)
     chunks: list[pd.DataFrame] = []
 
+    # Opt-in trace: log every real network fetch + caller, to audit cache-miss root causes.
+    if os.environ.get("LUMIBOT_CACHE_MISS_DEBUG"):
+        try:
+            import traceback
+            stack = "".join(traceback.format_stack(limit=10)[:-1])
+            logger.warning(
+                "[FETCH] sym=%s type=%s ts=%s start=%s end=%s source=%s\n%s",
+                getattr(asset, "symbol", None),
+                asset_type,
+                timestep,
+                start_dt.isoformat(),
+                end_dt.isoformat(),
+                source,
+                stack,
+            )
+        except Exception:
+            pass
+
     # Fetch backwards (end -> start) to accommodate IBKR's 1000 datapoint cap.
     while cursor_end > start_dt:
         payload = _ibkr_history_request(
@@ -1568,11 +1704,15 @@ def _fetch_history_between_dates(
         # IBKR typically returns {"data":[...]} (empty list means no data).
         data = payload.get("data") if isinstance(payload, dict) else None
         if not data:
+            # If we already fetched earlier chunks, keep them and stop paging.
+            # CME weekend/maintenance gaps (Fri 4pm CT → Sun 5pm CT, nightly 4–5pm CT)
+            # make a backward-paging window land in a no-trading range and return empty
+            # even when the surrounding bars are valid. Raising here discards every
+            # chunk we already collected and poisons the cache with a broad
+            # missing-window marker — then every subsequent call for the same asset
+            # takes the slow retry path. Break out with what we have.
             if chunks:
-                raise RuntimeError(
-                    "IBKR history pagination returned empty data before covering the requested window "
-                    f"for {getattr(asset, 'symbol', None)} {timestep} ({start_dt.isoformat()} -> {end_dt.isoformat()})"
-                )
+                break
 
             _record_missing_window(
                 asset=asset,
@@ -1588,11 +1728,10 @@ def _fetch_history_between_dates(
 
         df = _history_payload_to_frame(data, source_was_explicit=source_was_explicit)
         if df.empty:
+            # Same rationale as the empty-data branch above: an intermediate empty
+            # page during backward pagination must not discard earlier chunks.
             if chunks:
-                raise RuntimeError(
-                    "IBKR history pagination returned an empty frame before covering the requested window "
-                    f"for {getattr(asset, 'symbol', None)} {timestep} ({start_dt.isoformat()} -> {end_dt.isoformat()})"
-                )
+                break
 
             _record_missing_window(
                 asset=asset,
@@ -2452,6 +2591,24 @@ def _resolve_conid(*, asset: Asset, quote: Optional[Asset], exchange: Optional[s
             _RUNTIME_CONID_CACHE[key] = int(cached)
             return cached
 
+    if asset_type in {"future", "cont_future"} and primary.expiration:
+        same_month_cached = _lookup_same_month_future_conid_from_mapping(mapping=mapping, key=primary)
+        if same_month_cached is not None:
+            conid, actual_expiration = same_month_cached
+            actual_date = _date_from_yyyymmdd(actual_expiration)
+            if actual_date is not None:
+                setattr(asset, "_ibkr_resolved_expiration", actual_date)
+            logger.warning(
+                "IBKR conid registry has no exact key for %s expiring %s on %s; using unambiguous same-month contract %s.",
+                primary.symbol,
+                primary.expiration,
+                primary.exchange,
+                actual_expiration,
+            )
+            for key in candidates:
+                _RUNTIME_CONID_CACHE[key] = int(conid)
+            return int(conid)
+
     keys_added: set[str] = set()
     conid = _lookup_conid_remote(asset=asset, quote=quote, exchange=effective_exchange, mapping=mapping, keys_added=keys_added)
     # Always persist under the primary key for forward consistency.
@@ -2504,6 +2661,13 @@ def _is_terminal_no_data_error(exc: Exception) -> bool:
             "no data available",
             "does not have data",
             "asset does not exist",
+            # `_fetch_history_between_dates` raises this when IBKR pagination returns
+            # empty before we covered the requested window. In practice this happens
+            # for entitlement/stitching gaps (e.g. CONT_FUTURE 1-minute Trades) where
+            # the data will never be served — so treat it as a terminal no-data
+            # condition and persist a placeholder marker to skip future refetches.
+            "pagination returned empty data before covering",
+            "pagination returned an empty frame before covering",
         )
     )
 
@@ -2737,6 +2901,125 @@ def _lookup_conid_crypto(*, asset: Asset, quote: Optional[Asset]) -> int:
     )
 
 
+def _future_contract_date_strings(contract: Dict[str, Any]) -> list[str]:
+    """Return IBKR date fields for a listed futures contract in priority order."""
+    dates: list[str] = []
+    for field in ("expirationDate", "ltd", "lastTradeDate", "lastTradeDay", "lastTrade"):
+        raw = contract.get(field)
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if value.isdigit() and len(value) == 8 and value not in dates:
+            dates.append(value)
+    return dates
+
+
+def _future_contract_conid(contract: Dict[str, Any]) -> Optional[int]:
+    try:
+        conid = int(contract.get("conid"))
+    except Exception:
+        return None
+    return conid if conid > 0 else None
+
+
+def _remember_future_conid_mapping(
+    *,
+    mapping: Optional[Dict[str, int]],
+    keys_added: Optional[set[str]],
+    symbol: str,
+    exchange: str,
+    expiration: str,
+    conid: int,
+) -> None:
+    if mapping is None:
+        return
+    if not (expiration.isdigit() and len(expiration) == 8 and conid > 0):
+        return
+    key_blank = IbkrConidKey("future", symbol, "", exchange, expiration).to_key()
+    key_usd = IbkrConidKey("future", symbol, "USD", exchange, expiration).to_key()
+    for key in (key_blank, key_usd):
+        prior = mapping.get(key)
+        if prior != conid:
+            mapping[key] = conid
+            if keys_added is not None:
+                keys_added.add(key)
+
+
+def _select_future_contract_for_target(
+    *,
+    contracts: list[Dict[str, Any]],
+    target: str,
+) -> tuple[Optional[Dict[str, Any]], str, bool, list[str]]:
+    """Select a contract by exact date, then by unambiguous same contract month.
+
+    IBKR's listed `expirationDate`/`ltd` can differ from LumiBot's synthetic expiration
+    anchor by a day when a third Friday is a holiday. Same-month fallback is still strict:
+    it only succeeds when IBKR returns exactly one conid for the target YYYYMM.
+    """
+    same_month: Dict[int, tuple[Dict[str, Any], str]] = {}
+    same_month_dates: set[str] = set()
+    target_month = target[:6]
+
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+        conid = _future_contract_conid(contract)
+        if conid is None:
+            continue
+        dates = _future_contract_date_strings(contract)
+        if not dates:
+            continue
+        canonical_date = dates[0]
+        if target in dates:
+            return contract, canonical_date, False, []
+        for candidate in dates:
+            if target_month and candidate[:6] == target_month:
+                same_month_dates.add(candidate)
+                same_month.setdefault(conid, (contract, canonical_date))
+
+    if len(same_month) == 1:
+        contract, canonical_date = next(iter(same_month.values()))
+        return contract, canonical_date, True, sorted(same_month_dates)
+
+    return None, "", False, sorted(same_month_dates)
+
+
+def _lookup_same_month_future_conid_from_mapping(
+    *,
+    mapping: Dict[str, int],
+    key: IbkrConidKey,
+) -> Optional[tuple[int, str]]:
+    target = str(key.expiration or "")
+    if not (target.isdigit() and len(target) == 8):
+        return None
+    target_month = target[:6]
+    prefixes = (
+        IbkrConidKey(key.asset_type, key.symbol, "", key.exchange, "").to_key(),
+        IbkrConidKey(key.asset_type, key.symbol, "USD", key.exchange, "").to_key(),
+    )
+    matches: Dict[int, str] = {}
+    for raw_key, raw_conid in mapping.items():
+        raw_key_text = str(raw_key)
+        if not any(raw_key_text.startswith(prefix) for prefix in prefixes):
+            continue
+        expiration = raw_key_text.rsplit("|", 1)[-1]
+        if expiration == target:
+            continue
+        if not (expiration.isdigit() and len(expiration) == 8 and expiration[:6] == target_month):
+            continue
+        try:
+            conid = int(raw_conid)
+        except Exception:
+            continue
+        if conid > 0:
+            matches.setdefault(conid, expiration)
+
+    if len(matches) == 1:
+        conid, expiration = next(iter(matches.items()))
+        return conid, expiration
+    return None
+
+
 def _lookup_conid_future(
     *,
     asset: Asset,
@@ -2763,13 +3046,23 @@ def _lookup_conid_future(
     _load_negative_conid_cache()
     neg_root_key = IbkrConidKey("future", symbol_upper, "", desired_exchange, "").to_key()
     neg_target_key = IbkrConidKey("future", symbol_upper, "", desired_exchange, target).to_key() if target else ""
-    neg_hit = _NEGATIVE_CONID_CACHE.get(neg_root_key) or (_NEGATIVE_CONID_CACHE.get(neg_target_key) if neg_target_key else None)
-    if isinstance(neg_hit, dict):
-        cached_msg = str(neg_hit.get("message") or "").strip() or (
+    neg_root_hit = _NEGATIVE_CONID_CACHE.get(neg_root_key)
+    if isinstance(neg_root_hit, dict):
+        cached_msg = str(neg_root_hit.get("message") or "").strip() or (
             f"IBKR futures conid lookup is negatively cached for {symbol_upper} on {desired_exchange} (target={target or 'front_month'})."
         )
         logger.error("IBKR negative conid cache hit: %s", cached_msg)
         raise IbkrFuturesConidLookupError(cached_msg)
+    neg_target_hit = _NEGATIVE_CONID_CACHE.get(neg_target_key) if neg_target_key else None
+    if isinstance(neg_target_hit, dict):
+        cached_msg = str(neg_target_hit.get("message") or "").strip() or (
+            f"IBKR futures conid lookup is negatively cached for {symbol_upper} on {desired_exchange} (target={target})."
+        )
+        if _is_future_or_current_expiration(expiration):
+            logger.warning("Ignoring future-dated IBKR negative conid cache entry and retrying: %s", cached_msg)
+        else:
+            logger.error("IBKR negative conid cache hit: %s", cached_msg)
+            raise IbkrFuturesConidLookupError(cached_msg)
 
     query = {"symbols": asset.symbol, "exchange": desired_exchange, "secType": "FUT"}
     payload = queue_request(url=url, querystring=query, headers=None, timeout=None)
@@ -2796,42 +3089,69 @@ def _lookup_conid_future(
         for contract in contracts:
             if not isinstance(contract, dict):
                 continue
-            conid = contract.get("conid")
-            if conid is None:
-                continue
-            date_candidates = []
-            exp = contract.get("expirationDate")
-            if exp is not None:
-                date_candidates.append(exp)
-            ltd = contract.get("ltd") or contract.get("lastTradeDate") or contract.get("lastTradeDay") or contract.get("lastTrade")
-            if ltd is not None:
-                date_candidates.append(ltd)
-            try:
-                conid_int = int(conid)
-            except Exception:
-                continue
-            if conid_int <= 0:
+            conid_int = _future_contract_conid(contract)
+            if conid_int is None:
                 continue
 
-            for raw in date_candidates:
-                exp_str = str(raw).strip()
-                if not (exp_str.isdigit() and len(exp_str) == 8):
-                    continue
-                key_blank = IbkrConidKey("future", symbol_upper, "", desired_exchange, exp_str).to_key()
-                key_usd = IbkrConidKey("future", symbol_upper, "USD", desired_exchange, exp_str).to_key()
-                for k in (key_blank, key_usd):
-                    prior = mapping.get(k)
-                    if prior != conid_int:
-                        mapping[k] = conid_int
-                        if keys_added is not None:
-                            keys_added.add(k)
+            for exp_str in _future_contract_date_strings(contract):
+                _remember_future_conid_mapping(
+                    mapping=mapping,
+                    keys_added=keys_added,
+                    symbol=symbol_upper,
+                    exchange=desired_exchange,
+                    expiration=exp_str,
+                    conid=conid_int,
+                )
 
     if expiration is not None:
-        for contract in contracts:
-            exp_str = str(contract.get("expirationDate") or "").strip()
-            ltd_str = str(contract.get("ltd") or contract.get("lastTradeDate") or contract.get("lastTradeDay") or "").strip()
-            if exp_str == target or ltd_str == target:
-                return int(contract["conid"])
+        selected, actual_expiration, used_same_month, same_month_dates = _select_future_contract_for_target(
+            contracts=contracts,
+            target=target,
+        )
+        if selected is not None:
+            conid_int = _future_contract_conid(selected)
+            if conid_int is not None:
+                if actual_expiration:
+                    actual_date = _date_from_yyyymmdd(actual_expiration)
+                    if actual_date is not None:
+                        setattr(asset, "_ibkr_resolved_expiration", actual_date)
+                    _remember_future_conid_mapping(
+                        mapping=mapping,
+                        keys_added=keys_added,
+                        symbol=symbol_upper,
+                        exchange=desired_exchange,
+                        expiration=actual_expiration,
+                        conid=conid_int,
+                    )
+                if used_same_month and actual_expiration:
+                    _remember_future_conid_mapping(
+                        mapping=mapping,
+                        keys_added=keys_added,
+                        symbol=symbol_upper,
+                        exchange=desired_exchange,
+                        expiration=target,
+                        conid=conid_int,
+                    )
+                    logger.warning(
+                        "IBKR did not list %s %s on %s exactly; using unambiguous same-month contract %s (conid=%s).",
+                        symbol_upper,
+                        target,
+                        desired_exchange,
+                        actual_expiration,
+                        conid_int,
+                    )
+                elif actual_expiration and actual_expiration != target:
+                    logger.warning(
+                        "IBKR matched %s %s on %s by alternate date field; canonical listed date is %s (conid=%s).",
+                        symbol_upper,
+                        target,
+                        desired_exchange,
+                        actual_expiration,
+                        conid_int,
+                    )
+                if neg_target_key:
+                    _clear_negative_conid(key=neg_target_key)
+                return int(conid_int)
         msg = (
             f"IBKR did not return a conid for {symbol_upper} expiring {target} on {desired_exchange}. "
             "If this is an expired contract, IBKR Client Portal cannot reliably discover it. "
@@ -2839,6 +3159,11 @@ def _lookup_conid_future(
             "missing expiration. New contracts are expected to auto-populate via REST; only older "
             "historical gaps require a one-time TWS backfill."
         )
+        if same_month_dates:
+            msg += (
+                " IBKR returned same-month contract dates "
+                f"{', '.join(same_month_dates)}, but they were not an unambiguous single contract."
+            )
         if neg_target_key:
             _record_negative_conid(key=neg_target_key, reason="no_conid", message=msg)
         raise IbkrFuturesConidLookupError(msg)

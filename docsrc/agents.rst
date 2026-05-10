@@ -25,7 +25,8 @@ LumiBot is different because it combines all of these in one framework:
 - **@agent_tool for reliable external data.** Wrap any REST API as a callable tool using the ``@agent_tool`` decorator and the ``requests`` library. This is the primary and recommended pattern because it works reliably in both backtests and live trading.
 - **MCP server support.** Connect to any MCP-compatible server with a URL for live trading or when you have a compatible server. There are over 20,000 MCP servers available today.
 - **Replay caching for deterministic backtests.** Identical prompt + context + tools + timestamp = cached result. Warm reruns complete in seconds with zero model calls.
-- **Any LLM provider.** Use OpenAI, Anthropic, Google Gemini, or any provider supported by the underlying model router.
+- **Any LLM provider.** Use OpenAI, Anthropic, Google Gemini, xAI Grok, or any provider supported by the underlying model router. Swap models with a single env var; ``@agent_tool`` functions and replay cache work unchanged across all providers.
+- **Automatic retry on transient provider errors.** Rate limits (429), server errors (500/503/529), and transient network blips are retried automatically with exponential backoff. Production agents stay alive through normal cloud-provider hiccups without strategy-level error handling.
 - **Same code for backtest and live.** No separate "backtest mode" strategy. Write once, backtest it, deploy it.
 
 Quick Start
@@ -308,19 +309,28 @@ Most alternatives either put the LLM outside the backtest loop (QuantConnect), h
 
 **What AI models are supported?**
 
-The default model is Gemini (``gemini-3.1-flash-lite-preview``). You need a ``GOOGLE_API_KEY`` environment variable set. The architecture supports OpenAI, Anthropic, and other providers through the underlying model router. Pass the model name via the ``default_model`` parameter when creating your agent.
+LumiBot ships with first-class support for Gemini, OpenAI (GPT), xAI (Grok), Anthropic (Claude), and any other provider covered by LiteLLM (~100 providers). You pick the model per agent via the ``default_model`` parameter when creating your agent.
+
+Gemini ids (e.g. ``"gemini-3.1-flash-lite-preview"``) take Google ADK's native fast path. Anything else is automatically routed through LiteLLM using the provider-prefixed id format:
+
+- Gemini: ``"gemini-3.1-flash-lite-preview"`` (default) -- requires ``GEMINI_API_KEY``
+- OpenAI: ``"openai/gpt-5.4-mini"`` (good default), ``"openai/gpt-5.4"``, ``"openai/gpt-5.4-pro"``, ``"openai/gpt-5.4-nano"`` -- requires ``OPENAI_API_KEY``
+- xAI Grok: ``"xai/grok-4.20-0309-reasoning"`` (Grok 4.2, reasoning on, 2M ctx), ``"xai/grok-4-1-fast-reasoning-latest"`` (cheap/fast), or ``"xai/grok-4-latest"`` (older) -- requires ``XAI_API_KEY`` or ``GROK_API_KEY``
+- Anthropic Claude: ``"anthropic/claude-opus-4-7"``, ``"anthropic/claude-sonnet-4-6"`` -- requires ``ANTHROPIC_API_KEY``
+
+The replay cache keys on the model id, so swapping providers on the same backtest produces fresh runs rather than stale cross-model replays. Tool calling is normalized across providers by LiteLLM, so your ``@agent_tool`` functions work unchanged regardless of which model you pick.
 
 **How do I get started?**
 
-Install LumiBot, set ``GOOGLE_API_KEY`` in your environment, copy the Quick Start example on this page, and run it. The M2 Liquidity Strategy example is a complete, runnable strategy file. See :doc:`agents_quickstart` for additional patterns and :doc:`agents_canonical_demos` for the four reference demo strategies.
+Install LumiBot, set ``GEMINI_API_KEY`` in your environment, copy the Quick Start example on this page, and run it. The M2 Liquidity Strategy example is a complete, runnable strategy file. Provider-specific variants are available for OpenAI, Grok, and Anthropic. See :doc:`agents_quickstart` for additional patterns and :doc:`agents_canonical_demos` for the reference demo strategies.
 
 **What API keys do I need?**
 
-At minimum, ``GOOGLE_API_KEY`` for the Gemini model that powers the agent. If your ``@agent_tool`` functions call external APIs, you also need those keys -- for example ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` for Alpaca data APIs. The M2 Liquidity demo only needs ``GOOGLE_API_KEY`` because FRED data is public.
+At minimum, one model provider key matching the ``default_model`` you set: ``GEMINI_API_KEY`` for Gemini (the default), ``OPENAI_API_KEY`` for GPT models, ``XAI_API_KEY`` or ``GROK_API_KEY`` for Grok, or ``ANTHROPIC_API_KEY`` for Claude. If your ``@agent_tool`` functions call external APIs, you also need those keys -- for example ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` for Alpaca data APIs. The M2 Liquidity demo only needs one model-provider key because FRED data is public.
 
 **How do I set up my environment?**
 
-Create a ``.env`` file in your project directory with your API keys (e.g., ``GOOGLE_API_KEY=your_key_here``). LumiBot reads environment variables at startup. You can also export them in your shell. For backtesting, set ``BACKTESTING_DATA_SOURCE`` in ``.env`` or use ``datasource_class=None`` to defer to the environment configuration.
+Create a ``.env`` file in your project directory with your API keys (e.g., ``GEMINI_API_KEY=your_key_here``). LumiBot reads environment variables at startup. You can also export them in your shell. For backtesting, set ``BACKTESTING_DATA_SOURCE`` in ``.env`` or use ``datasource_class=None`` to defer to the environment configuration.
 
 **Can I use this for live trading?**
 
@@ -376,7 +386,7 @@ Describe your strategy's thesis and the assets it trades. Do not repeat instruct
 
 **What does LumiBot handle automatically in the base prompt?**
 
-The base prompt tells the agent whether the run is a backtest or live, the current datetime and timezone, current positions and cash, rules about look-ahead bias, the default investor policy (conviction over activity, no overtrading), position sizing and limit order preferences, and DuckDB conventions and tool usage guidance.
+The base prompt tells the agent whether the run is a backtest or live, the current datetime and timezone, current positions and cash, rules about look-ahead bias, the default investor policy (conviction over activity, no overtrading), risk and drawdown discipline (risk-adjusted returns over raw returns, recovery math, cut losers, no chasing after drawdowns, Sharpe/Sortino/Calmar framing), position sizing and limit order preferences, and DuckDB conventions and tool usage guidance.
 
 **Can I override the default investor policy?**
 
@@ -449,3 +459,211 @@ Use the replay cache -- once a backtest is cached, subsequent runs are free. Use
 **How does replay caching reduce costs?**
 
 The replay cache stores every agent run result keyed by a hash of the inputs. When the same prompt, context, tools, model, and timestamp appear again, the cached result is returned with zero LLM calls, zero external API calls, and zero cost. A cold backtest that costs a few dollars becomes free on every subsequent warm run.
+
+Error Handling and Reliability
+------------------------------
+
+.. note::
+
+   This section describes error handling **specific to AI agent calls**. The rest of LumiBot's main-loop error handling (strategy executor, brokers, data sources) is unchanged. The behavior below is scoped to ``AgentHandle.run()`` and ``GoogleADKRuntime.run()``; it does not alter how non-agent code paths react to exceptions.
+
+LumiBot's AI agent stack has three retry/safety layers that together keep live trading alive through provider outages and surface backtest-time bugs clearly:
+
+1. **LiteLLM-level HTTP retries.** When using non-Gemini providers, LiteLLM retries each individual HTTP call 3 times with provider-aware backoff (429 Retry-After awareness, capped exponential). Configured automatically in ``_configure_litellm_quietly`` (``num_retries=3``, ``drop_params=True``, ``suppress_debug_info=True``).
+
+2. **Runtime-level attempt retries.** ``GoogleADKRuntime.run()`` retries the full agent call up to **10 times** with capped exponential backoff (2s, 3s, 5s, 10s, 20s, 30s, 45s, 60s, 60s, 60s — total budget ~5 minutes). This covers session-setup errors, ADK runner glitches, and provider 5xx storms that LiteLLM's inner retry couldn't fix. Only transient and unknown errors retry; auth/config/billing errors surface immediately so we do not waste 5 minutes retrying a wrong API key.
+
+3. **Strategy-level safety net with live-vs-backtest branch.** ``AgentHandle.run()`` wraps the runtime call in a final catch. Behavior depends on two things: the error category and whether the strategy is in backtest mode or live.
+
+Error classifier buckets
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every exception from an agent call is classified by ``_classify_agent_error`` into one of five buckets:
+
+- ``auth`` -- missing or invalid API key, permission denied (401, 403)
+- ``config`` -- bad model id, malformed prompt, context-window exceeded, invalid payload (400, 404, 422)
+- ``billing`` -- out of credits, payment required, quota exhausted (402, 429 with ``insufficient_quota``, 403 with billing/credits keywords)
+- ``transient`` -- 5xx, rate-limit bursts, timeouts, connection errors
+- ``unknown`` -- anything not matched; treated as transient (safe default)
+
+The classifier looks at the exception class name, HTTP status code (if the provider SDK attached one), and message substring keywords (``insufficient_quota``, ``credits``, ``billing``, ``payment``, ``no credits``) so that a 403 returned with a billing message is correctly classified as ``billing`` rather than ``auth``.
+
+Backtest vs. live behavior
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
++--------------+------------------------------------------+----------------------------------+
+| Category     | Backtest                                 | Live                             |
++==============+==========================================+==================================+
+| ``auth``     | **Crash loud** with env-var guidance.    | Log + skip iteration.            |
++--------------+------------------------------------------+----------------------------------+
+| ``config``   | **Crash loud** with model/prompt hint.   | Log + skip iteration.            |
++--------------+------------------------------------------+----------------------------------+
+| ``billing``  | **Crash loud** with provider billing URL.| Log + skip iteration.            |
++--------------+------------------------------------------+----------------------------------+
+| ``transient``| Log + skip iteration (silent).           | Log + skip iteration.            |
++--------------+------------------------------------------+----------------------------------+
+| ``unknown``  | Log + skip iteration (safe default).     | Log + skip iteration.            |
++--------------+------------------------------------------+----------------------------------+
+
+**Live trading invariant**: an AI agent call never stops a live trading bot. Ever. Even a completely missing API key will log an error and continue — the operator can fix the env var and the bot resumes on the next iteration without a process restart. This is intentional: shutting down a live bot with real money at risk because of a provider hiccup is unacceptable.
+
+**Backtest philosophy**: surface bugs loudly. A silent +0% tearsheet caused by a wrong API key is worse than a clear error message — the user just started the run, can fix it, and re-run. Transient errors still skip silently because they are not bugs the user can act on.
+
+Skipped iteration result shape
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the safety net returns a graceful skip, the ``AgentRunResult`` includes:
+
+- ``summary`` starting with ``"RESULT: Skipped this iteration. Agent call failed (category=...)"``
+- a text event with payload ``{"runtime_error": True, "error_category": "...", "error_class": "...", "error_message": "...", "traceback": "..."}``
+- a warning in ``result.warnings`` with ``kind="agent_runtime_failure_skipped"`` and the category
+- ``cache_key = None`` (failures are never cached — next iteration retries fresh)
+
+Strategy authors can count skipped iterations with ``len([w for w in result.warnings if w.get("kind") == "agent_runtime_failure_skipped"])`` for post-run analysis.
+
+Model id visibility in tearsheets
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every time you call ``self.agents.create(name=..., default_model=...)``, the framework auto-populates ``self.parameters[f"agent_{name}_model"]`` with the resolved model id. This shows up automatically in the tearsheet's **Parameters Used** panel so every AI backtest self-identifies which model produced which tearsheet. Multi-agent strategies get one key per agent.
+
+Token usage and audit trail
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+LumiBot also writes AI usage details for every agent run during a backtest:
+
+- The tearsheet's **Parameters Used** panel shows running totals for each agent:
+
+  - ``agent_<name>_calls``
+  - ``agent_<name>_input_tokens``
+  - ``agent_<name>_output_tokens``
+  - ``agent_<name>_total_tokens``
+  - ``agent_<name>_thinking_tokens``
+  - ``agent_<name>_cached_input_tokens``
+  - ``agent_<name>_uncached_input_tokens``
+  - ``agent_<name>_latency_ms_avg``
+  - ``agent_<name>_tool_calls``
+  - ``agent_<name>_cache_hits``
+  - ``agent_<name>_detail_parquet``
+
+- A single detailed tabular artifact is written beside the normal backtest artifacts using the same base filename pattern:
+
+  - ``<run>_agent_detail.parquet``
+
+The Parquet file is the canonical machine-readable audit artifact used by BotSpot/MCP query tooling. LumiBot does not estimate provider pricing in this file because model prices change; it records raw token usage only.
+
+Each agent call gets one ``call_summary`` row plus one row per model event inside the call. This avoids repeating call-level token totals on every tool row while still preserving the event timeline. The file includes:
+
+- prompt/context fields (user system prompt, effective prompt, task prompt, runtime context)
+- event kind (``call_summary``, ``thinking``, ``text``, ``tool_call``, ``tool_result``, ``usage`` when present)
+- event text
+- tool name
+- flattened tool/event details in normal columns
+- full event payload JSON for exact forensic inspection
+- input/output/total token counts on the ``call_summary`` row
+- cached/uncached input token counts when the provider reports them
+- thinking token counts when the provider exposes them
+- latency fields for the full call and first model event
+- cache-hit flag and warnings
+
+This file is meant to answer practical debugging questions after a backtest:
+
+- What exactly did the agent say?
+- What tools did it call?
+- What came back from those tools?
+- How many tokens did that call use?
+- How many input tokens were cached vs. uncached?
+- How long did the call take?
+
+Thinking text is captured when the provider/SDK exposes it. Gemini thought summaries are requested automatically. Other providers may expose only thinking token counts and not the actual thought text.
+
+Provider prompt caching
+~~~~~~~~~~~~~~~~~~~~~~~
+
+LumiBot has two separate cache layers:
+
+- The LumiBot replay cache skips the entire agent call on identical warm backtests.
+- Provider prompt caching reduces cost/latency during cold backtests and live trading when the static prompt prefix repeats.
+
+The agent runtime keeps the large, stable instructions and tool definitions at the beginning of the request and moves dynamic fields such as current datetime, runtime mode, positions, orders, memory, task prompt, and user context into later request sections. This improves provider prefix-cache hit rates without changing strategy behavior.
+
+Provider-specific routing:
+
+- OpenAI models receive a stable ``prompt_cache_key`` plus ``prompt_cache_retention="24h"`` through LiteLLM.
+- xAI/Grok models receive a stable ``x-grok-conv-id`` header through LiteLLM.
+- Gemini native models use Gemini's implicit caching path. Explicit ADK context caching is a future optimization; the runtime already records Gemini ``cached_content_token_count`` when the provider reports it.
+
+Use ``scripts/run_agent_prompt_cache_probe.py`` to verify provider-reported cache behavior with real calls:
+
+.. code-block:: bash
+
+    python scripts/run_agent_prompt_cache_probe.py --model gemini-3.1-flash-lite-preview
+    python scripts/run_agent_prompt_cache_probe.py --model openai/gpt-5.4-mini
+
+The probe bypasses LumiBot's replay cache, sends repeated calls with the same long static prefix, and prints input tokens, cached input tokens, uncached input tokens, output tokens, and latency for each call.
+
+Built-in Alpaca news tool
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Strategies can use ``BuiltinTools.news.alpaca_news()`` to give an agent access to the Alpaca News API without writing a custom wrapper:
+
+.. code-block:: python
+
+    from lumibot.components.agents import BuiltinTools
+
+    self.agents.create(
+        name="trader",
+        system_prompt=(
+            "Use Alpaca news and market tools to make trading decisions. "
+            "Scan headlines and summaries first. If a story matters, fetch full article content before trading."
+        ),
+        tools=[BuiltinTools.news.alpaca_news()],
+    )
+
+The tool uses the user's own Alpaca credentials (``ALPACA_API_KEY`` / ``ALPACA_API_SECRET`` or the ``APCA_*`` aliases). It defaults ``end`` to the current simulated datetime in backtests and clamps future ``end`` values to avoid look-ahead. The response includes ``requested_end``, ``effective_end``, and ``lookahead_clamped`` so you can audit the exact window used.
+
+Alpaca news is historical symbol/date-window retrieval, not keyword search. The API supports ``symbols``, ``start``, ``end``, ``limit`` (max 50), ``sort``, ``include_content``, ``exclude_contentless``, and ``page_token``. For broad market context, query market ETF proxies such as ``SPY,QQQ,DIA,IWM``; for sector context, query sector ETFs such as ``XLK,SMH`` (tech/semis), ``XLF,KRE`` (financials/banks), ``XLE,USO`` (energy), ``XLV,XBI`` (healthcare/biotech), ``TLT,IEF,SHY`` (rates/bonds), or ``GLD,SLV,DBC`` (gold/commodities).
+
+Use a two-step workflow:
+
+1. Scan with ``include_content=False``. Use ``limit=10`` to ``20`` for focused single-symbol checks and ``limit=30`` to ``50`` for broad market or sector scans. This returns headlines, summaries, URLs, sources, timestamps, symbols, and ``next_page_token`` without dumping long article bodies into the model context.
+2. If a story looks important, call again for the same or narrower window with ``include_content=True`` and usually ``exclude_contentless=True``. Full article content is returned without truncation unless you explicitly pass ``content_max_chars``.
+3. If ``next_page_token`` is present and the first page does not provide enough evidence, call again with ``page_token=next_page_token``.
+
+Do not trade from one weak or noisy article. News can be sparse for single stocks, so broaden from the stock to its sector or market ETF when needed, compare article timestamps against the simulated datetime, and use ``page_token`` when the first page does not provide enough evidence.
+
+Complete runnable example:
+
+.. code-block:: python
+
+    import os
+    from lumibot.components.agents import BuiltinTools
+    from lumibot.strategies.strategy import Strategy
+
+    class AlpacaNewsBuiltinStrategy(Strategy):
+        def initialize(self):
+            self.sleeptime = "1D"
+            self.agents.create(
+                name="news_trader",
+                default_model=os.environ.get("AGENT_MODEL", "gemini-3.1-flash-lite-preview"),
+                system_prompt=(
+                    "Use Alpaca news and market tools to decide whether to hold SPY, QQQ, or a defensive ETF. "
+                    "First call alpaca_news with symbols='SPY,QQQ,DIA,IWM', include_content=False, and limit=30. "
+                    "If a story looks market-moving, call alpaca_news again with include_content=True and "
+                    "exclude_contentless=True before trading. "
+                    "Use page_token when next_page_token is returned."
+                ),
+                tools=[BuiltinTools.news.alpaca_news()],
+            )
+
+        def on_trading_iteration(self):
+            self.agents["news_trader"].run(
+                context={"current_datetime": self.get_datetime().isoformat()}
+            )
+
+See ``lumibot/example_strategies/agent_alpaca_news_builtin.py`` for the full example including the backtest runner.
+
+To run the live proof that validates historical relevance, full-content retrieval, and the resulting ``*_agent_detail.parquet`` artifact:
+
+.. code-block:: bash
+
+    python scripts/run_alpaca_news_ai_proof.py --model gemini-3.1-pro-preview

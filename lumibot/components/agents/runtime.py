@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import importlib
 import logging
 import json
@@ -8,6 +9,7 @@ import math
 import os
 import re
 import sys
+import time
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -287,6 +289,291 @@ class RuntimeRequest:
     runtime_context: dict[str, Any] | None
     memory_notes: list[dict[str, Any]]
     bound_tools: list[BoundTool]
+    provider_prompt_cache_key: str | None = None
+
+
+_LITELLM_CONFIGURED = False
+
+
+# Error classification for AI agent calls.
+#
+# The taxonomy has five buckets. Scope: AI agent calls only. The rest of
+# LumiBot's error handling (strategy_executor, brokers, data sources) is
+# unchanged. See `AgentHandle.run()` and `docsrc/agents.rst` for how these
+# buckets map to backtest-vs-live behavior.
+#
+#   "auth"      : missing/invalid API key, permission denied (401, 403)
+#   "config"    : bad model id, malformed prompt, context-window exceeded,
+#                 invalid payload (400, 404, 422)
+#   "billing"   : out of credits, payment required, quota exhausted (402,
+#                 429 + "insufficient_quota", 403 + billing/credits msg)
+#   "transient" : 5xx, rate-limit bursts, timeouts, connection errors
+#   "unknown"   : anything not matched above; treated as transient (safe default)
+
+_ERROR_CLASS_AUTH = (
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "UnauthenticatedError",
+    "NotAuthorized",
+)
+_ERROR_CLASS_CONFIG = (
+    "BadRequestError",
+    "NotFoundError",
+    "UnprocessableEntityError",
+    "ContextWindowExceededError",
+    "ContentPolicyViolationError",
+    "InvalidRequestError",
+    "ImportError",
+    "ModuleNotFoundError",
+)
+_ERROR_CLASS_BILLING = (
+    "BillingError",
+    "InsufficientQuotaError",
+    "PaymentRequiredError",
+)
+_ERROR_CLASS_TRANSIENT = (
+    "APIConnectionError",
+    "APIResponseValidationError",
+    "APITimeoutError",
+    "InternalServerError",
+    "ServerError",
+    "ServiceUnavailableError",
+    "Timeout",
+    "TimeoutError",
+    "OverloadedError",
+    "RateLimitError",
+    "ServerDisconnectedError",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "ConnectionError",
+)
+
+_BILLING_BODY_KEYWORDS = (
+    "insufficient_quota",
+    "insufficient funds",
+    "no credits",
+    "no credit",
+    "available credits",
+    "out of credits",
+    "spending limit",
+    "monthly spending limit",
+    "billing",
+    "payment",
+    "purchase those",
+    "team doesn't have any credits",
+    "team does not have any credits",
+    "quota exceeded",
+    "exceeded your current quota",
+)
+
+
+def _classify_agent_error(exc: BaseException) -> str:
+    """Map an exception raised by the AI agent stack to a bucket.
+
+    See the module-level docstring for the taxonomy. Safe default is
+    "unknown" so behavior matches "transient" (retry/skip) when we
+    cannot tell — failing closed is the wrong choice for AI errors
+    because most truly-unknown failures are transient provider issues.
+    """
+    exc_name = exc.__class__.__name__
+    message = str(exc)
+    message_lower = message.lower()
+
+    # HTTP status code if the provider SDK attached one.
+    status_code = None
+    for attr in ("status_code", "http_status", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            status_code = value
+            break
+
+    # Body/keyword check for billing — takes precedence over auth because
+    # providers often return 401/403 for "no credits" when the key itself
+    # is valid (e.g. xAI's "team doesn't have any credits yet").
+    if any(kw in message_lower for kw in _BILLING_BODY_KEYWORDS):
+        return "billing"
+
+    # Explicit class-name matches (litellm + google-genai + openai + anthropic).
+    if exc_name in _ERROR_CLASS_AUTH:
+        return "auth"
+    if exc_name in _ERROR_CLASS_CONFIG:
+        return "config"
+    if exc_name in _ERROR_CLASS_BILLING:
+        return "billing"
+    if exc_name in _ERROR_CLASS_TRANSIENT:
+        return "transient"
+
+    # HTTP status code based classification as a fallback.
+    if status_code is not None:
+        if status_code == 402:
+            return "billing"
+        if status_code in (401, 403):
+            # Already checked billing keywords above; if we got here it's auth.
+            return "auth"
+        if status_code == 404:
+            return "config"
+        if status_code in (400, 422):
+            return "config"
+        if status_code == 429:
+            # Rate limits are transient; insufficient_quota already caught above.
+            return "transient"
+        if 500 <= status_code < 600:
+            return "transient"
+
+    # Message substring fallback for providers that don't use standard class names.
+    lower_exc = exc_name.lower()
+    if any(kw in lower_exc for kw in ("auth", "permission", "unauthorized", "apikey")):
+        return "auth"
+    if "context" in lower_exc and ("length" in lower_exc or "window" in lower_exc):
+        return "config"
+    if any(kw in message_lower for kw in ("api key", "apikey", "unauthenticated", "permission denied")):
+        return "auth"
+    if "invalid model" in message_lower or "model not found" in message_lower:
+        return "config"
+    if "context length" in message_lower or "context_length" in message_lower or "context window" in message_lower:
+        return "config"
+
+    return "unknown"
+
+
+def _configure_litellm_quietly() -> None:
+    # LiteLLM's provider-lookup path in get_llm_provider_logic.py prints a
+    # red "Provider List: https://docs.litellm.ai/docs/providers" banner to
+    # stderr on internal probes (cost/tokenizer lookups for models not in
+    # litellm.model_cost). The banner is purely cosmetic: real failures
+    # still raise BadRequestError. New model ids (e.g. gpt-5.4-*, grok-4.20)
+    # routinely ship before LiteLLM's static registry catches up, so this
+    # banner would fire on every agent call for current-generation models.
+    # suppress_debug_info mutes the banner without suppressing exceptions.
+    global _LITELLM_CONFIGURED
+    if _LITELLM_CONFIGURED:
+        return
+    try:
+        import litellm
+    except ImportError:
+        _LITELLM_CONFIGURED = True
+        return
+    try:
+        litellm.suppress_debug_info = True
+    except Exception:
+        pass
+    # Provider param compatibility: Google ADK's LiteLlm bridge emits
+    # OpenAI-shaped params (e.g. max_completion_tokens). Some providers
+    # (xAI, Anthropic, a few others) reject unknown params with
+    # UnsupportedParamsError. drop_params makes LiteLLM silently drop
+    # params the target provider does not accept instead of failing the
+    # call. Affects only unknown kwargs; real errors still propagate.
+    try:
+        litellm.drop_params = True
+    except Exception:
+        pass
+    # Transient-error retry: rate-limit (429), server errors (500/502/503/529),
+    # and brief network blips all happen in normal operation. LiteLLM has
+    # provider-aware retry logic (exponential backoff, 429 Retry-After
+    # awareness). Enable it at the library level so every provider benefits.
+    # Does NOT retry 4xx client errors (auth, invalid model, context length).
+    try:
+        litellm.num_retries = 3
+    except Exception:
+        pass
+    _LITELLM_CONFIGURED = True
+
+
+def _sync_xai_api_key_alias() -> None:
+    """Allow Grok users to provide either the vendor key name or product name.
+
+    LiteLLM's xAI provider reads XAI_API_KEY. LumiBot's older Grok helper also
+    accepts GROK_API_KEY, so mirror GROK_API_KEY into XAI_API_KEY for xai/ models
+    when the canonical xAI env var is absent.
+    """
+    if not os.environ.get("XAI_API_KEY") and os.environ.get("GROK_API_KEY"):
+        os.environ["XAI_API_KEY"] = os.environ["GROK_API_KEY"]
+
+
+def _sync_gemini_api_key_alias() -> None:
+    """Allow product-facing GEMINI_API_KEY with Google SDK internals.
+
+    Google examples and some SDK paths use GOOGLE_API_KEY. LumiBot's public
+    docs use GEMINI_API_KEY, so mirror it when the Google name is absent.
+    """
+    if not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
+        os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+
+
+def _provider_prompt_cache_key(request: RuntimeRequest) -> str:
+    """Stable provider-routing key for server-side prompt caches.
+
+    This is not LumiBot's replay cache key. It intentionally excludes the
+    changing market context so providers can reuse the static prefix
+    (system prompt + tool declarations) while still computing each new bar.
+    """
+    payload = {
+        "agent": request.agent_name,
+        "model": request.model,
+        "system_prompt": request.system_prompt,
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "source": tool.source,
+                "metadata": tool.metadata,
+            }
+            for tool in request.bound_tools
+        ],
+    }
+    digest = hashlib.sha256(json.dumps(_json_safe_value(payload), sort_keys=True).encode("utf-8")).hexdigest()
+    return f"lumibot:{request.agent_name}:{digest[:32]}"
+
+
+def _resolve_model_for_adk(model: Any, *, prompt_cache_key: str | None = None) -> Any:
+    # Native Gemini IDs take ADK's fast path as plain strings. Any other
+    # provider prefix (e.g. "openai/...", "xai/...", "anthropic/...") is
+    # routed through google.adk.models.lite_llm.LiteLlm which normalizes
+    # tool-call shapes and auth across ~100 providers via LiteLLM.
+    if not isinstance(model, str):
+        return model
+    lower = model.strip().lower()
+    if lower.startswith("gemini-") or lower.startswith("models/gemini"):
+        _sync_gemini_api_key_alias()
+        return model
+    if lower.startswith("xai/"):
+        _sync_xai_api_key_alias()
+    _configure_litellm_quietly()
+    try:
+        from google.adk.models.lite_llm import LiteLlm
+    except ImportError as exc:
+        raise ImportError(
+            f"Agent model '{model}' requires the 'litellm' package. "
+            "Install it with: pip install litellm"
+        ) from exc
+    kwargs: dict[str, Any] = {}
+    if prompt_cache_key:
+        if lower.startswith("openai/"):
+            # OpenAI prompt caching is automatic for long shared prefixes. The
+            # key improves routing stability and 24h is the documented maximum
+            # extended retention value.
+            kwargs["prompt_cache_key"] = prompt_cache_key
+            kwargs["prompt_cache_retention"] = "24h"
+        elif lower.startswith("xai/"):
+            # xAI recommends x-grok-conv-id for Chat Completions cache routing.
+            kwargs["headers"] = {"x-grok-conv-id": prompt_cache_key}
+    return LiteLlm(model=model, **kwargs)
+
+
+def _supports_explicit_temperature_for_adk_model(model: Any) -> bool:
+    """Return True only for ADK-native models known to accept temperature.
+
+    ADK's LiteLlm bridge forwards GenerateContentConfig fields to provider APIs.
+    OpenAI GPT-5/reasoning-class models reject custom temperature values and only
+    allow the provider default. Passing temperature=0.0 therefore breaks those
+    models before the agent can run. Keep deterministic temperature only on the
+    Gemini-native path; let LiteLLM providers use their provider defaults unless
+    a future explicit per-provider compatibility layer is added.
+    """
+    if not isinstance(model, str):
+        return False
+    lower = model.strip().lower()
+    return lower.startswith("gemini-") or lower.startswith("models/gemini")
 
 
 class GoogleADKRuntime:
@@ -320,6 +607,38 @@ class GoogleADKRuntime:
         self._google_genai_types = google_genai_types
         return self._llm_agent_type, self._runner_type, self._genai_types, self._function_tool_type
 
+    @staticmethod
+    def _maybe_build_gemini_thinking_planner(model: Any, genai_types: Any) -> Any | None:
+        """Gemini 3 thought text only shows up when ADK thinking is enabled via
+        BuiltInPlanner, not GenerateContentConfig.
+
+        BotSpot already uses this path successfully. LumiBot originally tried to
+        set `ThinkingConfig(include_thoughts=True)` inside
+        `GenerateContentConfig`, which still yielded thought token counts but not
+        explicit thought parts in normalized events. This helper mirrors the
+        BotSpot pattern so real thought parts can flow through `_normalize_event`.
+        """
+        if not isinstance(model, str):
+            return None
+        lower_model = model.strip().lower()
+        if not lower_model.startswith("gemini-3"):
+            return None
+        thinking_config_type = getattr(genai_types, "ThinkingConfig", None)
+        if thinking_config_type is None:
+            return None
+        try:
+            planners_module = importlib.import_module("google.adk.planners")
+        except ImportError:
+            return None
+        planner_type = getattr(planners_module, "BuiltInPlanner", None)
+        if planner_type is None:
+            return None
+        try:
+            thinking_config = thinking_config_type(include_thoughts=True)
+            return planner_type(thinking_config=thinking_config)
+        except Exception:
+            return None
+
     def _instruction_for(self, request: RuntimeRequest) -> str:
         lines = [request.system_prompt.strip()]
         lines.append("")
@@ -327,13 +646,6 @@ class GoogleADKRuntime:
         lines.append("- Use tools for structured data and trading actions.")
         lines.append("- Use DuckDB for time-series analysis when historical tables are available.")
         lines.append("- Return a short final summary after you finish using tools.")
-        if request.memory_notes:
-            lines.append("")
-            lines.append("Persistent memory from earlier runs:")
-            for note in request.memory_notes[-5:]:
-                timestamp = note.get("timestamp") or "unknown_time"
-                summary = note.get("summary") or ""
-                lines.append(f"- {timestamp}: {summary}")
         return "\n".join(lines).strip()
 
     def _build_user_text(self, request: RuntimeRequest) -> str:
@@ -341,6 +653,11 @@ class GoogleADKRuntime:
         if request.runtime_context:
             sections.append(
                 f"Runtime Context JSON:\n{json.dumps(_json_safe_value(request.runtime_context), sort_keys=True, default=str)}"
+            )
+        if request.memory_notes:
+            sections.append(
+                "Persistent Memory JSON:\n"
+                f"{json.dumps(_json_safe_value(request.memory_notes[-5:]), sort_keys=True, default=str)}"
             )
         if request.task_prompt:
             sections.append(f"Task:\n{request.task_prompt.strip()}")
@@ -351,18 +668,29 @@ class GoogleADKRuntime:
         return "\n\n".join(sections)
 
     async def _run_async(self, request: RuntimeRequest) -> AgentRunResult:
+        started_at = _utc_iso_timestamp()
+        started_perf = time.perf_counter()
+        first_event_at: str | None = None
+        first_event_perf: float | None = None
         LlmAgentType, InMemoryRunnerType, genai_types, function_tool_type = self._ensure_adk()
         tool_name_map = {_tool_function_name(tool.name): tool.name for tool in request.bound_tools}
         tools = [function_tool_type(_wrap_tool_callable(tool)) for tool in request.bound_tools]
+        config_kwargs: dict[str, Any] = {
+            "max_output_tokens": 65535,
+        }
+        if _supports_explicit_temperature_for_adk_model(request.model):
+            config_kwargs["temperature"] = 0.0
+        planner = self._maybe_build_gemini_thinking_planner(request.model, genai_types)
         agent = LlmAgentType(
             name=request.agent_name,
-            model=request.model,
+            model=_resolve_model_for_adk(
+                request.model,
+                prompt_cache_key=request.provider_prompt_cache_key or _provider_prompt_cache_key(request),
+            ),
             instruction=self._instruction_for(request),
             tools=tools,
-            generate_content_config=genai_types.GenerateContentConfig(
-                temperature=0.0,
-                max_output_tokens=65535,
-            ),
+            generate_content_config=genai_types.GenerateContentConfig(**config_kwargs),
+            planner=planner,
         )
         runner = InMemoryRunnerType(agent=agent, app_name="lumibot-agents")
         session_id = str(uuid4())
@@ -378,12 +706,17 @@ class GoogleADKRuntime:
         )
         events: list[AgentTraceEvent] = []
         async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
-            events.extend(_normalize_event(event))
-        timestamp = _utc_iso_timestamp()
+            normalized_events = _normalize_event(event)
+            if normalized_events and first_event_perf is None:
+                first_event_perf = time.perf_counter()
+                first_event_at = _utc_iso_timestamp()
+            timestamp = _utc_iso_timestamp()
+            for normalized_event in normalized_events:
+                normalized_event.timestamp = timestamp
+            events.extend(normalized_events)
         for event in events:
             if event.tool_name:
                 event.tool_name = tool_name_map.get(event.tool_name, event.tool_name)
-            event.timestamp = timestamp
         summary = None
         text_chunks = [event.text for event in events if event.kind == "text" and event.text]
         if text_chunks:
@@ -393,15 +726,78 @@ class GoogleADKRuntime:
             if event.kind == "usage":
                 usage = event.payload
                 break
+        ended_at = _utc_iso_timestamp()
+        ended_perf = time.perf_counter()
         return AgentRunResult(
             summary=summary,
             model=request.model,
             events=events,
             usage=usage,
+            started_at=started_at,
+            first_event_at=first_event_at,
+            ended_at=ended_at,
+            latency_ms=max(int((ended_perf - started_perf) * 1000), 0),
+            first_event_latency_ms=(
+                max(int((first_event_perf - started_perf) * 1000), 0)
+                if first_event_perf is not None
+                else None
+            ),
         )
 
+    # Transient-error retry policy for the full agent call. Covers both the
+    # Gemini-native path (google-genai exceptions) and the LiteLlm path
+    # (network/timeouts below LiteLLM's own retry layer). LiteLLM already
+    # retries individual HTTP calls 3x; this outer retry handles whole-run
+    # failures like session setup errors, ADK runner glitches, and anything
+    # else that bubbles up.
+    #
+    # Retry schedule: 10 attempts with per-step backoff capped at 60s so no
+    # single wait exceeds one minute. Total budget ~= 5 minutes across all
+    # attempts. Prefer more small tries over a few long ones — most cloud
+    # provider 5xx storms clear within seconds or low-minutes, and a 5-min
+    # budget covers the common case without leaving a live bot frozen for
+    # 10 minutes on a single call. If the provider is still down after
+    # this budget, the strategy-level safety net (in manager.py's
+    # AgentHandle.run) catches the failure and skips this iteration so
+    # the strategy stays alive and retries on the next bar.
+    _MAX_RUN_ATTEMPTS = 10
+    _RETRY_BACKOFF_SECONDS = (2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 60.0, 60.0)
+
+    @staticmethod
+    def _is_non_retryable(exc: BaseException) -> bool:
+        # Use the shared classifier: only transient and unknown errors retry.
+        # auth / config / billing surface immediately so we don't waste ~5
+        # minutes of retry budget on a wrong API key.
+        return _classify_agent_error(exc) not in ("transient", "unknown")
+
     def run(self, request: RuntimeRequest) -> AgentRunResult:
-        return asyncio.run(self._run_async(request))
+        import time as _time
+
+        last_exc: BaseException | None = None
+        for attempt in range(1, self._MAX_RUN_ATTEMPTS + 1):
+            try:
+                return asyncio.run(self._run_async(request))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:  # noqa: BLE001 - intentional broad catch for retry
+                last_exc = exc
+                if self._is_non_retryable(exc):
+                    raise
+                if attempt >= self._MAX_RUN_ATTEMPTS:
+                    break
+                delay = self._RETRY_BACKOFF_SECONDS[min(attempt - 1, len(self._RETRY_BACKOFF_SECONDS) - 1)]
+                try:
+                    sys.stderr.write(
+                        f"[lumibot.agents] transient error on attempt {attempt}/{self._MAX_RUN_ATTEMPTS} "
+                        f"for model={request.model!r}: {exc.__class__.__name__}: {str(exc)[:240]}. "
+                        f"Retrying in {delay:.0f}s...\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                _time.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
 
 class StubAgentRuntime:

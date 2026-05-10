@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import time
@@ -176,6 +177,16 @@ class BacktestingBroker(Broker):
         self._last_cache_clear = None
         # Market open lookup cache (populated when calendars are initialized)
         self._market_open_cache = {}
+        self._trading_day_date_set = set()
+        self._trading_close_values = None
+        self._trading_close_datetimes = None
+        self._trading_market_open_values = None
+        self._time_to_open_cache_datetime = None
+        self._time_to_open_cache_value = None
+        self._time_to_close_cache_datetime = None
+        self._time_to_close_cache_value = None
+        self._next_trading_day_cache_datetime = None
+        self._next_trading_day_cache_value = None
         # Track per-strategy futures lots for accurate margin/P&L when flipping
         self._futures_lot_ledgers = defaultdict(list)
 
@@ -203,6 +214,7 @@ class BacktestingBroker(Broker):
             0.05,
             minimum=0.0,
         )
+        self._option_early_assignment_config_cache = {}
         self._option_early_assignment_last_eval = {}
         # Track end-of-data to prevent infinite loops when end date is in the future
         self._end_of_trading_days_reached = False
@@ -233,11 +245,25 @@ class BacktestingBroker(Broker):
         super().initialize_market_calendars(trading_days_df)
         # Prepare caches when calendar is set
         self._market_open_cache = {}
+        self._trading_day_date_set = set()
+        self._trading_close_values = None
+        self._trading_close_datetimes = None
+        self._trading_market_open_values = None
+        self._time_to_open_cache_datetime = None
+        self._time_to_open_cache_value = None
+        self._time_to_close_cache_datetime = None
+        self._time_to_close_cache_value = None
+        self._next_trading_day_cache_datetime = None
+        self._next_trading_day_cache_value = None
         self._daily_sessions = {}
         self._sessions_built = False
         if self._trading_days is None or len(self._trading_days) == 0:
             return
         self._market_open_cache = self._trading_days['market_open'].to_dict()
+        self._trading_day_date_set = set(self._trading_days.index.date)
+        self._trading_close_values = self._trading_days.index.values
+        self._trading_close_datetimes = self._trading_days.index.tolist()
+        self._trading_market_open_values = self._trading_days["market_open"].tolist()
         for close_time in self._trading_days.index:
             open_time = self._market_open_cache[close_time]
             for dt in (open_time, close_time):
@@ -287,18 +313,21 @@ class BacktestingBroker(Broker):
 
     def _contiguous_session_time(self, now, idx):
         """Return remaining time when sessions share a boundary (e.g., futures, crypto)."""
-        if not self.is_market_open():
-            return None
-
         next_idx = idx + 1
         if next_idx >= len(self._trading_days):
             return None
 
-        next_close = self._trading_days.index[next_idx]
-        next_open = self._get_market_open_for_close(next_close)
-        if next_open is None:
-            return None
+        trading_close_datetimes = getattr(self, "_trading_close_datetimes", None)
+        if trading_close_datetimes is None:
+            trading_close_datetimes = self._trading_days.index.tolist()
+            self._trading_close_datetimes = trading_close_datetimes
+        market_open_values = getattr(self, "_trading_market_open_values", None)
+        if market_open_values is None:
+            market_open_values = self._trading_days["market_open"].tolist()
+            self._trading_market_open_values = market_open_values
 
+        next_close = trading_close_datetimes[next_idx]
+        next_open = market_open_values[next_idx]
         if next_open <= now < next_close:
             return (next_close - now).total_seconds()
 
@@ -343,7 +372,7 @@ class BacktestingBroker(Broker):
     def get_historical_account_value(self):
         pass
 
-    def get_active_tracked_orders(self, strategy: str) -> list[Order]:
+    def get_active_tracked_orders(self, strategy: str, asset=None) -> list[Order]:
         """Return active (open/submitted/new) orders for the given strategy.
 
         Backtests can accumulate tens of thousands of filled orders over long windows.
@@ -361,11 +390,18 @@ class BacktestingBroker(Broker):
         except Exception:
             # Fallback to the slower path if internal buckets are unavailable.
             orders = self.get_tracked_orders(strategy=strategy)
-            return [o for o in orders if o.is_active()] if orders else []
+            if not orders:
+                return []
+            return [
+                o for o in orders
+                if o.is_active() and (asset is None or getattr(o, "asset", None) == asset)
+            ]
 
         for bucket in buckets:
             for order in bucket:
                 if getattr(order, "strategy", None) != strategy:
+                    continue
+                if asset is not None and getattr(order, "asset", None) != asset:
                     continue
                 # Buckets should already contain only active orders, but keep a defensive check.
                 if order.is_active():
@@ -470,28 +506,55 @@ class BacktestingBroker(Broker):
 
     def _get_next_trading_day(self):
         now = self.datetime
-        search = self._trading_days[now < self._trading_days.market_open]
-        if search.empty:
+        if now == getattr(self, "_next_trading_day_cache_datetime", None):
+            return getattr(self, "_next_trading_day_cache_value", None)
+
+        market_open_values = self._trading_days["market_open"].values
+        now_value = pd.Timestamp(now).asm8
+        idx = market_open_values.searchsorted(now_value, side="right")
+        if idx >= len(self._trading_days):
             self._mark_end_of_trading_days(now)
+            self._next_trading_day_cache_datetime = now
+            self._next_trading_day_cache_value = None
             return None
 
-        return search.market_open[0].to_pydatetime()
+        result = self._trading_days["market_open"].iat[idx].to_pydatetime()
+        self._next_trading_day_cache_datetime = now
+        self._next_trading_day_cache_value = result
+        return result
 
     def get_time_to_open(self):
         """Return the remaining time for the market to open in seconds"""
         now = self.datetime
+        if now == getattr(self, "_time_to_open_cache_datetime", None):
+            return getattr(self, "_time_to_open_cache_value", None)
 
-        search = self._trading_days[now < self._trading_days.index]
-        if search.empty:
+        trading_close_values = getattr(self, "_trading_close_values", None)
+        if trading_close_values is None:
+            trading_close_values = self._trading_days.index.values
+            self._trading_close_values = trading_close_values
+        market_open_values = getattr(self, "_trading_market_open_values", None)
+        if market_open_values is None:
+            market_open_values = self._trading_days["market_open"].tolist()
+            self._trading_market_open_values = market_open_values
+
+        now_value = pd.Timestamp(now).asm8
+        idx = trading_close_values.searchsorted(now_value, side="right")
+        if idx >= len(self._trading_days):
             self._mark_end_of_trading_days(now)
+            self._time_to_open_cache_datetime = now
+            self._time_to_open_cache_value = None
             return None
 
-        trading_day = search.iloc[0]
-        open_time = trading_day.market_open
-
-        # DEBUG: Log what's happening
-        logger.debug(f"[BROKER DEBUG] get_time_to_open: now={now}, next_trading_day={trading_day.name}, "
-                     f"open_time={open_time}")
+        open_time = market_open_values[idx]
+        if logger.isEnabledFor(logging.DEBUG):
+            next_close = self._trading_days.index[idx]
+            logger.debug(
+                "[BROKER DEBUG] get_time_to_open: now=%s, next_trading_day=%s, open_time=%s",
+                now,
+                next_close,
+                open_time,
+            )
 
         # For Backtesting, sometimes the user can just pass in dates (i.e. 2023-08-01) and not datetimes
         # In this case the "now" variable is starting at midnight, so we need to adjust the open_time to be actual
@@ -501,53 +564,88 @@ class BacktestingBroker(Broker):
         if self.IS_BACKTESTING_BROKER and now > open_time:
             # Check if now.date() is in trading days before overriding
             now_date = now.date() if hasattr(now, 'date') else now
-            trading_day_dates = self._trading_days.index.date
+            trading_day_dates = getattr(self, "_trading_day_date_set", None) or set(self._trading_days.index.date)
             if now_date in trading_day_dates:
-                logger.debug(f"[BROKER DEBUG] Overriding open_time to datetime_start because now ({now}) is on a "
-                             f"trading day but after market open")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[BROKER DEBUG] Overriding open_time to datetime_start because now (%s) is on a trading day but after market open",
+                        now,
+                    )
                 open_time = self.data_source.datetime_start
             else:
-                logger.debug(f"[BROKER DEBUG] NOT overriding open_time because now ({now}) is NOT a trading day")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[BROKER DEBUG] NOT overriding open_time because now (%s) is NOT a trading day",
+                        now,
+                    )
 
         if now >= open_time:
-            logger.debug(f"[BROKER DEBUG] Market already open: now={now} >= open_time={open_time}, returning 0")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[BROKER DEBUG] Market already open: now=%s >= open_time=%s, returning 0",
+                    now,
+                    open_time,
+                )
+            self._time_to_open_cache_datetime = now
+            self._time_to_open_cache_value = 0
             return 0
 
         delta = open_time - now
-        logger.debug(f"[BROKER DEBUG] Market opens in {delta.total_seconds()} seconds")
-        return delta.total_seconds()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[BROKER DEBUG] Market opens in %s seconds", delta.total_seconds())
+        result = delta.total_seconds()
+        self._time_to_open_cache_datetime = now
+        self._time_to_open_cache_value = result
+        return result
 
     def get_time_to_close(self):
         """Return the remaining time for the market to close in seconds"""
         now = self.datetime
+        if now == getattr(self, "_time_to_close_cache_datetime", None):
+            return getattr(self, "_time_to_close_cache_value", None)
 
-        # Use searchsorted for efficient searching and reduce unnecessary DataFrame access
-        idx = self._trading_days.index.searchsorted(now, side='left')
+        trading_close_values = getattr(self, "_trading_close_values", None)
+        if trading_close_values is None:
+            trading_close_values = self._trading_days.index.values
+            self._trading_close_values = trading_close_values
+        trading_close_datetimes = getattr(self, "_trading_close_datetimes", None)
+        if trading_close_datetimes is None:
+            trading_close_datetimes = self._trading_days.index.tolist()
+            self._trading_close_datetimes = trading_close_datetimes
+        market_open_values = getattr(self, "_trading_market_open_values", None)
+        if market_open_values is None:
+            market_open_values = self._trading_days["market_open"].tolist()
+            self._trading_market_open_values = market_open_values
+
+        now_value = pd.Timestamp(now).asm8
+        idx = trading_close_values.searchsorted(now_value, side="left")
 
         if idx >= len(self._trading_days):
-            logger.warning(f"Backtest has reached the end of available trading days data. Current time: {now}, Last trading day: {self._trading_days.index[-1] if len(self._trading_days) > 0 else 'No data'}")
+            self._mark_end_of_trading_days(now)
             # Return None to signal that backtesting should stop
+            self._time_to_close_cache_datetime = now
+            self._time_to_close_cache_value = None
             return None
 
-        # Directly access the data needed using more efficient methods
-        market_close_time = self._trading_days.index[idx]
-        market_open = self._get_market_open_for_close(market_close_time)
-        if market_open is None:
-            logger.warning("Missing market_open for %s; cannot compute time_to_close", market_close_time)
-            return None
-        market_close = market_close_time  # Assuming this is a scalar value directly from the index
+        market_close = trading_close_datetimes[idx]
+        market_open = market_open_values[idx]
 
         # If we're before the market opens for the found trading day,
         # count the whole time until that day's market close so the clock
         # can advance instead of stalling.
         if now < market_open:
             delta = market_close - now
-            return delta.total_seconds()
+            result = delta.total_seconds()
+            self._time_to_close_cache_datetime = now
+            self._time_to_close_cache_value = result
+            return result
 
         delta_seconds = (market_close - now).total_seconds()
         if delta_seconds <= 0:
             contiguous_seconds = self._contiguous_session_time(now, idx)
             if contiguous_seconds is not None:
+                self._time_to_close_cache_datetime = now
+                self._time_to_close_cache_value = contiguous_seconds
                 return contiguous_seconds
 
             logger.debug(
@@ -555,37 +653,56 @@ class BacktestingBroker(Broker):
                 now,
                 market_close,
             )
+            self._time_to_close_cache_datetime = now
+            self._time_to_close_cache_value = 0.0
             return 0.0
 
+        self._time_to_close_cache_datetime = now
+        self._time_to_close_cache_value = delta_seconds
         return delta_seconds
 
     def _await_market_to_open(self, timedelta=None, strategy=None):
         # Process outstanding orders first before waiting for market to open
         # or else they don't get processed until the next day
-        logger.debug(f"[BROKER DEBUG] _await_market_to_open called, current "
-                     f"datetime={self.datetime}, timedelta={timedelta}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[BROKER DEBUG] _await_market_to_open called, current datetime=%s, timedelta=%s",
+                self.datetime,
+                timedelta,
+            )
         self.process_pending_orders(strategy=strategy)
 
         time_to_open = self.get_time_to_open()
-        logger.debug(f"[BROKER DEBUG] get_time_to_open returned: {time_to_open}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[BROKER DEBUG] get_time_to_open returned: %s", time_to_open)
 
         # If None is returned, it means we've reached the end of available trading days
         if time_to_open is None:
-            logger.debug(f"[BROKER DEBUG] time_to_open is None, returning early")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[BROKER DEBUG] time_to_open is None, returning early")
             return
 
         # Allow the caller to specify a buffer (in minutes) before the actual open
         if timedelta:
             time_to_open -= 60 * timedelta
-            logger.debug(f"[BROKER DEBUG] Adjusted time_to_open for timedelta buffer: {time_to_open}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[BROKER DEBUG] Adjusted time_to_open for timedelta buffer: %s",
+                    time_to_open,
+                )
 
         # Only advance time if there is something positive to advance;
         # prevents zero or negative time updates.
         if time_to_open <= 0:
-            logger.debug(f"[BROKER DEBUG] time_to_open <= 0 ({time_to_open}), returning without advancing time")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[BROKER DEBUG] time_to_open <= 0 (%s), returning without advancing time",
+                    time_to_open,
+                )
             return
 
-        logger.debug(f"[BROKER DEBUG] Advancing time by {time_to_open} seconds")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[BROKER DEBUG] Advancing time by %s seconds", time_to_open)
         self._update_datetime(time_to_open)
 
     def _await_market_to_close(self, timedelta=None, strategy=None):
@@ -1320,22 +1437,43 @@ class BacktestingBroker(Broker):
         default_enabled = getattr(self, "_option_early_assignment_default_enabled", False)
         default_max_dte_days = getattr(self, "_option_early_assignment_default_max_dte_days", 1)
         default_max_extrinsic = getattr(self, "_option_early_assignment_default_max_extrinsic", 0.05)
+        raw_enabled = parameters.get("option_early_assignment_enabled")
+        raw_max_dte_days = parameters.get("option_early_assignment_max_dte_days")
+        raw_max_extrinsic = parameters.get("option_early_assignment_max_extrinsic")
+        cache_input = (
+            raw_enabled,
+            raw_max_dte_days,
+            raw_max_extrinsic,
+            default_enabled,
+            default_max_dte_days,
+            default_max_extrinsic,
+        )
+        cache = getattr(self, "_option_early_assignment_config_cache", None)
+        if cache is None:
+            cache = {}
+            self._option_early_assignment_config_cache = cache
+        strategy_key = id(strategy)
+        cached = cache.get(strategy_key)
+        if cached is not None and cached[0] == cache_input:
+            return cached[1]
 
         enabled = self._coerce_to_bool(
-            parameters.get("option_early_assignment_enabled"),
+            raw_enabled,
             default_enabled,
         )
         max_dte_days = self._coerce_to_int(
-            parameters.get("option_early_assignment_max_dte_days"),
+            raw_max_dte_days,
             default_max_dte_days,
             minimum=1,
         )
         max_extrinsic = self._coerce_to_float(
-            parameters.get("option_early_assignment_max_extrinsic"),
+            raw_max_extrinsic,
             default_max_extrinsic,
             minimum=0.0,
         )
-        return enabled, max_dte_days, max_extrinsic
+        result = (enabled, max_dte_days, max_extrinsic)
+        cache[strategy_key] = (cache_input, result)
+        return result
 
     def _is_cash_settled_index_option(self, option_asset: Asset, underlying_asset: Asset) -> bool:
         if getattr(underlying_asset, "asset_type", None) == Asset.AssetType.INDEX:
@@ -2728,7 +2866,65 @@ class BacktestingBroker(Broker):
                             continue
                         df = df_original[df_original.index >= now_ts]
                     else:
-                        df = df_original[df_original.index >= self.datetime]
+                        # FABRICATION GUARD (2026-04-15 incident fix):
+                        # The previous logic (`df_original[>= self.datetime]` then
+                        # `iloc[-1:]` fallback) can silently fabricate fills by picking
+                        # a bar that is far in the future when `df_original` contains
+                        # rows well beyond `self.datetime`. Observed symptom: Alpha Picks
+                        # stock fills frozen at the *open of 2026-04-10* for every fill
+                        # across 2022-2024 because that row was the penultimate bar in
+                        # `df_original` and the forward filter caught it.
+                        #
+                        # Correct semantics for a daily-cadence market fill:
+                        # 1) Prefer a bar within a narrow future window (same session or
+                        #    the next session) so we still price forward when the current
+                        #    bar is available.
+                        # 2) Otherwise fall back to the most recent bar AT OR BEFORE
+                        #    `self.datetime` — never to an arbitrary future bar.
+                        # 3) If nothing is within a reasonable window of `self.datetime`,
+                        #    refuse to fill (skip the order) rather than inventing a price.
+                        sim_ts = pd.Timestamp(self.datetime)
+                        # Normalize timezone so comparisons are consistent with the frame index.
+                        try:
+                            if getattr(df_original.index, "tz", None) is not None:
+                                if sim_ts.tz is None:
+                                    sim_ts = sim_ts.tz_localize(df_original.index.tz)
+                                else:
+                                    sim_ts = sim_ts.tz_convert(df_original.index.tz)
+                        except Exception:
+                            pass
+
+                        if str(timestep) == "day":
+                            future_window = timedelta(days=2)
+                        elif str(timestep) == "hour":
+                            future_window = timedelta(hours=2)
+                        else:
+                            future_window = timedelta(minutes=5)
+
+                        future_bars = df_original[
+                            (df_original.index >= sim_ts)
+                            & (df_original.index <= sim_ts + future_window)
+                        ]
+                        if len(future_bars) > 0:
+                            df = future_bars.iloc[:1]
+                        else:
+                            past_bars = df_original[df_original.index <= sim_ts]
+                            if len(past_bars) == 0:
+                                # No bar at or before sim time AND no bar in the future
+                                # window. Refuse to fabricate a fill. Skip this order this
+                                # iteration; it will retry next bar.
+                                if strategy is not None:
+                                    display_symbol = getattr(order.asset, "symbol", order.asset)
+                                    order_identifier = getattr(order, "identifier", None)
+                                    if order_identifier is None:
+                                        order_identifier = getattr(order, "id", "<unknown>")
+                                    strategy.log_message(
+                                        f"[DIAG] No bar near {self.datetime} for {display_symbol}; "
+                                        f"refusing to fabricate fill for {order.order_type} id={order_identifier}",
+                                        color="yellow",
+                                    )
+                                continue
+                            df = past_bars.iloc[-1:]
 
                     # If the dataframe is empty, then we should get the last row of the original dataframe
                     # because it is the best data we have
@@ -2736,6 +2932,34 @@ class BacktestingBroker(Broker):
                         df = df_original.iloc[-1:]
 
                     dt = df.index[0]
+                    # FABRICATION GUARD (2026-04-15 incident fix): never price a fill
+                    # from a bar that is more than `max_fill_distance_days` away from the
+                    # simulated clock. This catches the flat-price class of bugs where
+                    # upstream returns a frame whose rows are far in the future relative
+                    # to `self.datetime`.
+                    try:
+                        selected_ts = pd.Timestamp(dt)
+                        sim_ts_for_check = pd.Timestamp(self.datetime)
+                        if getattr(selected_ts, "tz", None) is not None and sim_ts_for_check.tz is None:
+                            sim_ts_for_check = sim_ts_for_check.tz_localize(selected_ts.tz)
+                        elif getattr(selected_ts, "tz", None) is None and sim_ts_for_check.tz is not None:
+                            sim_ts_for_check = sim_ts_for_check.tz_localize(None)
+                        elif getattr(selected_ts, "tz", None) is not None and sim_ts_for_check.tz is not None:
+                            sim_ts_for_check = sim_ts_for_check.tz_convert(selected_ts.tz)
+                        max_fill_distance = timedelta(days=7) if str(timestep) == "day" else timedelta(days=1)
+                        if abs(selected_ts - sim_ts_for_check) > max_fill_distance:
+                            logger.error(
+                                "[FILL][REJECT] Selected bar %s is %s away from sim dt %s for %s; "
+                                "refusing to fabricate fill (order=%s).",
+                                selected_ts,
+                                abs(selected_ts - sim_ts_for_check),
+                                sim_ts_for_check,
+                                getattr(order.asset, "symbol", order.asset),
+                                getattr(order, "identifier", getattr(order, "id", "<unknown>")),
+                            )
+                            continue
+                    except Exception as _distance_err:  # noqa: F841
+                        pass
                     open = df["open"].iloc[0]
                     high = df["high"].iloc[0]
                     low = df["low"].iloc[0]

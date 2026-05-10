@@ -12,6 +12,12 @@ from lumibot.tools.lumibot_logger import get_logger
 
 logger = get_logger(__name__)
 
+# PERF: `find_asset_in_data_store()` is called in tight loops (often 200K+ times per backtest). It
+# constructs `Asset("USD", "forex")` as the default quote on every call, which shows up as ~3s of
+# pure `Asset.__init__` overhead in yappi profiles. Cache a module-level singleton so repeated
+# lookups reuse the same object (Asset is effectively value-typed for USD/forex).
+_USD_FOREX = Asset("USD", "forex")
+
 
 class PandasData(DataSourceBacktesting):
     """
@@ -44,6 +50,10 @@ class PandasData(DataSourceBacktesting):
         # PERF: `find_asset_in_data_store()` is called in tight loops (quotes + history). Cache the
         # resolved key for repeated `(asset, quote, timestep)` lookups within a backtest run.
         self._find_asset_in_data_store_cache = {}
+        # PERF: When a lookup misses, the missing-asset warning fires once per iteration. On a 1-min
+        # futures backtest that's ~65K warnings and ~4s of LumibotLogger overhead. Gate the warning
+        # to first-encounter per (asset, timestep) so it still surfaces the problem once.
+        self._missing_asset_warned = set()
 
     @staticmethod
     def _set_pandas_data_keys(pandas_data):
@@ -263,7 +273,12 @@ class PandasData(DataSourceBacktesting):
                 if pd.isna(price):
                     # Provide more specific error message for index assets
                     if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
-                        logger.warning(f"Index asset `{asset.symbol}` returned NaN price. This could be due to missing data for the index or a subscription issue if using Polygon.io. Note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
+                        logger.warning(
+                            "Index asset `%s` returned a NaN price. This data source did not provide usable "
+                            "index data for the requested window. Verify that index coverage and any required "
+                            "subscriptions are enabled for the active provider.",
+                            asset.symbol,
+                        )
                     else:
                         logger.info(f"Error getting last price for {tuple_to_find}: price is NaN")
                     return None
@@ -292,7 +307,12 @@ class PandasData(DataSourceBacktesting):
         else:
             # Provide more specific error message when asset not found in data store
             if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
-                logger.warning(f"The index asset `{asset.symbol}` does not exist or does not have data. Index data may not be available from this data source. If using Polygon, note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
+                logger.warning(
+                    "The index asset `%s` does not exist or has no data in this data source. Verify that the "
+                    "active provider supports index data for this symbol and that any required subscriptions "
+                    "are enabled.",
+                    asset.symbol,
+                )
             return None
 
     def get_quote(self, asset, quote=None, exchange=None) -> Quote:
@@ -381,6 +401,12 @@ class PandasData(DataSourceBacktesting):
         requested_unit = None
         normalized_key = None
         asset_for_type = asset[0] if isinstance(asset, tuple) else asset
+        asset_lookup = asset_for_type
+        quote_lookup = quote
+        if isinstance(asset, tuple) and len(asset) >= 2 and quote_lookup is None:
+            tuple_quote = asset[1]
+            if isinstance(tuple_quote, Asset):
+                quote_lookup = tuple_quote
         requested_asset_type = str(getattr(asset_for_type, "asset_type", "") or "").strip().lower()
         if "." in requested_asset_type:
             requested_asset_type = requested_asset_type.split(".")[-1]
@@ -435,22 +461,24 @@ class PandasData(DataSourceBacktesting):
         candidates = []
 
         if timestep is not None:
-            base_quote = quote if quote is not None else Asset("USD", "forex")
-            candidates.append((asset, base_quote, timestep))
+            base_quote = quote_lookup if quote_lookup is not None else _USD_FOREX
+            candidates.append((asset_lookup, base_quote, timestep))
             if normalized_key is not None and str(normalized_key) != str(timestep):
-                candidates.append((asset, base_quote, normalized_key))
-            if quote is not None:
-                candidates.append((asset, Asset("USD", "forex"), timestep))
+                candidates.append((asset_lookup, base_quote, normalized_key))
+            if quote_lookup is not None:
+                candidates.append((asset_lookup, _USD_FOREX, timestep))
                 if normalized_key is not None and str(normalized_key) != str(timestep):
-                    candidates.append((asset, Asset("USD", "forex"), normalized_key))
+                    candidates.append((asset_lookup, _USD_FOREX, normalized_key))
 
-        if quote is not None:
-            candidates.append((asset, quote))
+        if quote_lookup is not None:
+            candidates.append((asset_lookup, quote_lookup))
 
-        if isinstance(asset, Asset) and asset.asset_type in ["option", "future", "cont_future", "stock", "index"]:
-            candidates.append((asset, Asset("USD", "forex")))
+        if isinstance(asset_lookup, Asset) and asset_lookup.asset_type in ["option", "future", "cont_future", "stock", "index"]:
+            candidates.append((asset_lookup, _USD_FOREX))
 
-        candidates.append(asset)
+        candidates.append(asset_lookup)
+        if asset_lookup is not asset:
+            candidates.append(asset)
 
         for key in candidates:
             if key in self._data_store:
@@ -487,10 +515,20 @@ class PandasData(DataSourceBacktesting):
         if asset_to_find in self._data_store:
             data = self._data_store[asset_to_find]
         else:
-            if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
-                logger.warning(f"The index asset `{asset.symbol}` does not exist or does not have data. Index data may not be available from this data source. If using Polygon, note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
-            else:
-                logger.warning(f"The asset: `{asset}` does not exist or does not have data.")
+            # PERF: Gate to first-encounter per (asset, timestep). In 1-min backtests this warning
+            # fired ~65K times/run with no new info, costing ~4s of logger overhead.
+            warn_key = (asset, str(timestep))
+            if warn_key not in self._missing_asset_warned:
+                self._missing_asset_warned.add(warn_key)
+                if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
+                    logger.warning(
+                        "The index asset `%s` does not exist or has no data in this data source. Verify that the "
+                        "active provider supports index data for this symbol and that any required subscriptions "
+                        "are enabled.",
+                        asset.symbol,
+                    )
+                else:
+                    logger.warning(f"The asset: `{asset}` does not exist or does not have data.")
             return
 
         now = self.get_datetime()
@@ -520,10 +558,19 @@ class PandasData(DataSourceBacktesting):
         if asset_to_find in self._data_store:
             data = self._data_store[asset_to_find]
         else:
-            if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
-                logger.warning(f"The index asset `{asset.symbol}` does not exist or does not have data. Index data may not be available from this data source. If using Polygon, note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
-            else:
-                logger.warning(f"The asset: `{asset}` does not exist or does not have data.")
+            # PERF: Gate to first-encounter per (asset, timestep). See _pull_source_symbol_bars.
+            warn_key = (asset, str(timestep))
+            if warn_key not in self._missing_asset_warned:
+                self._missing_asset_warned.add(warn_key)
+                if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
+                    logger.warning(
+                        "The index asset `%s` does not exist or has no data in this data source. Verify that the "
+                        "active provider supports index data for this symbol and that any required subscriptions "
+                        "are enabled.",
+                        asset.symbol,
+                    )
+                else:
+                    logger.warning(f"The asset: `{asset}` does not exist or does not have data.")
             return
 
         try:

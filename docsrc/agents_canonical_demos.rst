@@ -1,17 +1,93 @@
 Canonical AI Agent Demos
 ========================
 
-LumiBot includes four canonical AI agent demo strategies that serve as both reference implementations and end-to-end acceptance tests for agentic backtesting. All four use the ``@agent_tool`` pattern with the ``requests`` library, the full built-in tool set, replay caching, and benchmarked tearsheet output.
+LumiBot includes six canonical AI agent demo strategies that serve as both reference implementations and end-to-end acceptance tests for agentic backtesting. These examples cover both custom ``@agent_tool`` wrappers and built-in agent tools, the full built-in tool set, replay caching, and benchmarked tearsheet output.
 
 These are complete, runnable strategies -- not snippets. They demonstrate how to backtest an AI trading agent with real external data sources, and they validate that LumiBot's AI-driven trading strategy backtest pipeline works end to end. All demo files are located in ``lumibot/example_strategies/``.
 
-The Four Demos
+The Six Demos
 ---------------
 
+- **Discretionary Trader** (``lumibot/example_strategies/agent_discretionary.py``) -- **maximum-discretion agent** with a one-sentence prompt, no asset whitelist, broad tool surface, and an ``AGENT_MODEL`` env var for multi-provider comparisons (Gemini, GPT, Grok, Claude)
+- **Alpaca News Built-in Strategy** (``lumibot/example_strategies/agent_alpaca_news_builtin.py``) -- recommended built-in-tool pattern for Alpaca/Benzinga news: scan headlines/summaries first, fetch full article bodies on demand, and use pagination when needed
 - **News Sentiment Strategy** (``lumibot/example_strategies/agent_news_sentiment.py``) -- event-driven stock selection using Alpaca news data
 - **Macro Risk Strategy** (``lumibot/example_strategies/agent_macro_risk.py``) -- macro regime allocation using Alpaca market data
 - **Momentum Allocator Strategy** (``lumibot/example_strategies/agent_momentum_allocator.py``) -- momentum and sentiment allocation using Alpaca price bars and news
 - **M2 Liquidity Strategy** (``lumibot/example_strategies/agent_m2_liquidity.py``) -- liquidity-driven allocation using FRED money supply data
+
+The first demo (Discretionary Trader) intentionally gives the AI maximum latitude so you can compare how different frontier models (Gemini 3.1 Pro, GPT-5.4, Grok 4.2) perform with minimal guidance. The Alpaca News Built-in Strategy is the recommended news-tool template for new code. The older News Sentiment Strategy intentionally remains as a custom ``@agent_tool`` example for users who need to wrap their own REST APIs.
+
+Discretionary Trader
+--------------------
+
+**File:** ``lumibot/example_strategies/agent_discretionary.py``
+
+Maximum-discretion AI trader. The user system prompt is literally one sentence: *"Make as much money as you possibly can."* Everything else -- risk discipline, drawdown protection, position sizing, look-ahead safety, tool-use guidance -- comes from LumiBot's base prompt. The agent picks its own universe (any US-listed stock or ETF via Yahoo), shorts if it wants, and decides when to park in cash-equivalents.
+
+**Tools:**
+
+- ``get_fred_series`` -- FRED macro data (M2SL, FEDFUNDS, CPIAUCSL, T10Y2Y, VIXCLS, DCOILWTICO, etc.)
+- ``BuiltinTools.news.alpaca_news()`` -- Alpaca/Benzinga historical news with bring-your-own Alpaca credentials; scan headlines/summaries first, then fetch full article content with ``include_content=True`` when needed
+- ``get_fundamentals`` -- yfinance fundamentals snapshot (P/E, forward P/E, market cap, profit margins, earnings date, analyst targets, short interest, 52W high/low, sector, industry)
+- Plus all built-in tools (portfolio, positions, last_price, history, orders, DuckDB, docs)
+
+**What it demonstrates:**
+
+- The ``AGENT_MODEL`` env var pattern for parameterizing model choice without editing strategy code
+- The standard ``BACKTESTING_START`` / ``BACKTESTING_END`` env vars for cheap short-window validation runs
+- How multi-provider model comparison works in LumiBot (same strategy code, different LLM)
+- Minimal user prompt + full base prompt delivering real discretionary behavior
+- yfinance-based fundamentals wrapped as an ``@agent_tool`` with zero new dependencies
+- Automatic token totals in the tearsheet plus a detailed ``*_agent_detail.parquet`` audit file beside the backtest artifacts
+
+**What it is useful for:**
+
+- Apples-to-apples multi-provider model benchmarking
+- Testing how frontier LLMs reason over real market data with little guidance
+- A template for building research-heavy AI strategies where the thesis is not pre-baked
+
+**How to run it against different providers:**
+
+.. code-block:: bash
+
+    # Google Gemini 3.1 Pro (default)
+    export GEMINI_API_KEY='your-key'
+    export BACKTESTING_START='2026-03-01'
+    export BACKTESTING_END='2026-03-31'
+    AGENT_MODEL="gemini-3.1-pro-preview" python agent_discretionary.py
+
+    # OpenAI GPT-5.4
+    export OPENAI_API_KEY='your-key'
+    AGENT_MODEL="openai/gpt-5.4" python agent_discretionary.py
+
+    # xAI Grok 4.2 (reasoning)
+    export XAI_API_KEY='your-key'
+    AGENT_MODEL="xai/grok-4.20-0309-reasoning" python agent_discretionary.py
+
+    # Anthropic Claude
+    export ANTHROPIC_API_KEY='your-key'
+    AGENT_MODEL="anthropic/claude-opus-4-7" python agent_discretionary.py
+
+After the backtest finishes, the tearsheet will show the model id and cumulative token totals in **Parameters Used**, and the run directory will also contain ``*_agent_detail.parquet`` with one ``call_summary`` row per AI call plus event rows for thinking/text/tool calls/tool results/usage.
+
+Use ``scripts/run_alpaca_news_ai_proof.py`` when you need a cheap real-provider proof that the built-in news tool retrieves relevant historical articles, fetches full content on demand, and records the calls in ``*_agent_detail.parquet``.
+
+See ``scripts/run_discretionary_3way.py`` for a parallel runner that executes the same strategy against three providers concurrently with a memory watchdog and auto-retry on transient provider errors.
+
+Alpaca News Built-in Strategy
+-----------------------------
+
+**File:** ``lumibot/example_strategies/agent_alpaca_news_builtin.py``
+
+This strategy demonstrates the preferred way to give an AI agent Alpaca/Benzinga news access: pass ``BuiltinTools.news.alpaca_news()`` to ``self.agents.create(...)`` instead of writing a strategy-local Alpaca wrapper.
+
+**What it demonstrates:**
+
+- Built-in news-tool wiring with ``tools=[BuiltinTools.news.alpaca_news()]``
+- Scan-first workflow with ``include_content=False`` and broad-market symbols like ``SPY,QQQ,DIA,IWM``
+- Full article retrieval with ``include_content=True`` before trading on important stories
+- Pagination via ``next_page_token`` / ``page_token`` when the first page does not provide enough evidence
+- Backtest look-ahead protection through timestamp discipline and the tool's ``lookahead_clamped`` field
 
 News Sentiment Strategy
 -----------------------
@@ -163,11 +239,11 @@ Frequently Asked Questions
 
 **Which demo should I start with?**
 
-Start with ``agent_m2_liquidity.py`` if you want the simplest setup -- it only needs ``GOOGLE_API_KEY`` because FRED data is public. Start with ``agent_news_sentiment.py`` if you want a multi-stock news-driven strategy and have Alpaca API keys.
+Start with ``agent_m2_liquidity.py`` if you want the simplest setup -- it only needs ``GEMINI_API_KEY`` because FRED data is public. If you want to test another provider without changing strategy code, use ``agent_m2_liquidity_openai.py``, ``agent_m2_liquidity_grok.py``, or ``agent_m2_liquidity_anthropic.py``. Start with ``agent_news_sentiment.py`` if you want a multi-stock news-driven strategy and have Alpaca API keys.
 
 **Do these demos work out of the box?**
 
-Yes. Set the required API keys (``GOOGLE_API_KEY`` for all demos, plus ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` for the Alpaca-based demos) and run the file directly with ``python3 agent_m2_liquidity.py``. Each demo is a complete, self-contained strategy file.
+Yes. Set the required model provider key for the demo you are running (for example ``GEMINI_API_KEY`` for Gemini, ``OPENAI_API_KEY`` for OpenAI, ``XAI_API_KEY`` or ``GROK_API_KEY`` for Grok, or ``ANTHROPIC_API_KEY`` for Claude), plus ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` for the Alpaca-based demos, and run the file directly with ``python3 agent_m2_liquidity.py``. Each demo is a complete, self-contained strategy file.
 
 **Can I modify the demos?**
 

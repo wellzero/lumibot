@@ -1,0 +1,102 @@
+import os
+import sys
+import types
+
+from lumibot.components.agents.runtime import (
+    _resolve_model_for_adk,
+    _supports_explicit_temperature_for_adk_model,
+    _sync_gemini_api_key_alias,
+    _sync_xai_api_key_alias,
+)
+
+
+def test_grok_api_key_alias_populates_xai_api_key(monkeypatch):
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setenv("GROK_API_KEY", "grok-test-key")
+
+    _sync_xai_api_key_alias()
+
+    assert os.environ["XAI_API_KEY"] == "grok-test-key"
+
+
+def test_xai_api_key_wins_over_grok_alias(monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
+    monkeypatch.setenv("GROK_API_KEY", "grok-test-key")
+
+    _sync_xai_api_key_alias()
+
+    assert os.environ["XAI_API_KEY"] == "xai-test-key"
+
+
+def test_gemini_api_key_alias_populates_google_api_key(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+
+    _sync_gemini_api_key_alias()
+
+    assert os.environ["GOOGLE_API_KEY"] == "gemini-test-key"
+
+
+def test_google_api_key_wins_over_gemini_alias(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-test-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+
+    _sync_gemini_api_key_alias()
+
+    assert os.environ["GOOGLE_API_KEY"] == "google-test-key"
+
+
+def test_openai_model_forwards_prompt_cache_key_and_24h_retention(monkeypatch):
+    created: dict[str, object] = {}
+
+    class FakeLiteLlm:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    fake_module = types.ModuleType("google.adk.models.lite_llm")
+    fake_module.LiteLlm = FakeLiteLlm
+    monkeypatch.setitem(sys.modules, "google.adk.models.lite_llm", fake_module)
+
+    result = _resolve_model_for_adk("openai/gpt-5.4-mini", prompt_cache_key="stable-prefix-key")
+
+    assert isinstance(result, FakeLiteLlm)
+    assert created["model"] == "openai/gpt-5.4-mini"
+    assert created["prompt_cache_key"] == "stable-prefix-key"
+    assert created["prompt_cache_retention"] == "24h"
+
+
+def test_xai_model_forwards_grok_conversation_cache_header(monkeypatch):
+    created: dict[str, object] = {}
+
+    class FakeLiteLlm:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    fake_module = types.ModuleType("google.adk.models.lite_llm")
+    fake_module.LiteLlm = FakeLiteLlm
+    monkeypatch.setitem(sys.modules, "google.adk.models.lite_llm", fake_module)
+
+    result = _resolve_model_for_adk("xai/grok-4.20-0309-reasoning", prompt_cache_key="stable-prefix-key")
+
+    assert isinstance(result, FakeLiteLlm)
+    assert created["model"] == "xai/grok-4.20-0309-reasoning"
+    assert created["headers"] == {"x-grok-conv-id": "stable-prefix-key"}
+
+
+def test_gemini_native_path_uses_plain_model_id_for_implicit_or_adk_context_cache():
+    # Gemini stays on ADK's native path. Provider prompt-cache routing kwargs are
+    # only for LiteLLM providers; Gemini implicit caching and ADK explicit
+    # ContextCacheConfig are configured outside the LiteLLM wrapper.
+    assert _resolve_model_for_adk("gemini-3.1-pro-preview", prompt_cache_key="stable-prefix-key") == "gemini-3.1-pro-preview"
+
+
+def test_explicit_temperature_only_sent_to_gemini_native_models():
+    assert _supports_explicit_temperature_for_adk_model("gemini-3.1-pro-preview") is True
+    assert _supports_explicit_temperature_for_adk_model("models/gemini-3.1-pro-preview") is True
+
+    # GPT-5/reasoning-class OpenAI models reject custom temperature values; the
+    # provider default is the only accepted value.
+    assert _supports_explicit_temperature_for_adk_model("openai/gpt-5.4") is False
+    assert _supports_explicit_temperature_for_adk_model("openai/gpt-5.4-mini") is False
+    assert _supports_explicit_temperature_for_adk_model("xai/grok-4.20-0309-reasoning") is False
+    assert _supports_explicit_temperature_for_adk_model("anthropic/claude-opus-4-7") is False

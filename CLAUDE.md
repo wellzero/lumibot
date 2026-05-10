@@ -1,9 +1,21 @@
 # CLAUDE.md - AI Assistant Instructions for LumiBot
 
+## 🚨🚨🚨 RULE #1 — NEVER FABRICATE BACKTEST DATA 🚨🚨🚨
+
+**Fake / synthesized / default-filled market data is STRICTLY FORBIDDEN.**
+**Missing data is fine. Fake data is a lawsuit waiting to happen.**
+
+- If real bars are unavailable for a day / symbol / timeframe, return empty. Do NOT invent a placeholder bar, do NOT carry-forward the last price, do NOT substitute a constant (e.g. `VIX=14.2`), do NOT interpolate.
+- This applies to **every provider path** (IBKR, ThetaData, Polygon, Yahoo, DataBento, custom) and **every timestep** (minute, day, tick).
+- Placeholder rows used for cache bookkeeping ("we tried this day, nothing was there") must NEVER be returned to a strategy as real bars. Filter them out, and surface the absence to the caller.
+- If you find code that fabricates/synthesizes/forward-fills missing market data to keep a strategy alive — **delete it**. The honest outcome (empty frame, explicit warning, strategy skip) is the ONLY correct outcome.
+- A backtest that makes decisions on fake data produces fake PnL. Showing fake PnL to customers is a legal and reputational catastrophe.
+- Full details and enforcement rules live in `docs/BACKTESTING_ARCHITECTURE.md` under "RULE #1". Read it before touching any data-fetching code.
+
 ## Quick Start
 
 **First, read these files:**
-1. `docs/BACKTESTING_ARCHITECTURE.md` - Understand the backtesting data flow
+1. `docs/BACKTESTING_ARCHITECTURE.md` - Understand the backtesting data flow AND the no-fake-data rule
 2. `AGENTS.md` - Critical rules for ThetaData (DO NOT SKIP)
 
 ## Backtesting Accuracy (Definition)
@@ -24,6 +36,46 @@ This repo is often worked on by **multiple AI sessions** at the same time.
 - Before committing: `git status` must be clean/understood; read diffs for changes you didn’t personally create.
 - Coordinate via `docs/handoffs/` when touching shared areas (CI/baselines/backtest harnesses).
 - Any behavioral change must include docs updates + regression tests, with comments explaining “why/invariants”.
+
+## Branch Management (CRITICAL - Branches Are Extremely Sensitive)
+
+**ALWAYS stay on a `version/X.Y.Z` branch.** Never work on `master`, `main`, or `dev` directly. If you find yourself on `master` or `main`, something is wrong. Fix it immediately by switching to the current version branch.
+
+### At session start (MANDATORY every time)
+```bash
+git branch --show-current  # MUST be version/X.Y.Z
+grep ‘version=’ setup.py   # MUST match the branch name
+```
+If the branch is NOT `version/X.Y.Z`, find the latest version branch and switch to it:
+```bash
+git fetch origin
+git branch -r | grep ‘version/’ | sort -V | tail -1  # Find latest
+git switch version/X.Y.Z                               # Switch to it
+```
+
+### Before every commit (MANDATORY)
+```bash
+git branch --show-current  # Verify still on version/X.Y.Z
+```
+
+### Deployment procedure (follow `docs/DEPLOYMENT.md` strictly)
+1. **All work** happens on `version/X.Y.Z`. Never push directly to `dev`.
+2. **Before release**: merge `dev` into `version/X.Y.Z` to pick up other engineers’ changes.
+3. **Release**: merge `version/X.Y.Z` into `dev` via PR, tag `vX.Y.Z` on the dev merge commit.
+4. **After release (CRITICAL, DO NOT SKIP)**: the release workflow auto-creates `version/X.Y.(Z+1)` on the REMOTE. You must switch your LOCAL checkout to it. Steps:
+   - `git status --porcelain=v1` — if non-empty, commit as `wip: carry-over to X.Y.(Z+1)` on the OLD branch first.
+   - `git fetch origin && git switch version/X.Y.(Z+1)` (never `git checkout`).
+   - If you had local-only commits on `version/X.Y.Z` (including the carry-over above), cherry-pick them onto the new branch.
+   - Verify: `git branch --show-current` must print `version/X.Y.(Z+1)`; `grep 'version=' setup.py` must match.
+   - Staying on the released branch locally causes every new commit to land on frozen code and uncommitted work to silently belong to the wrong version (the 2026-04-20 4.5.1 incident — WEEX/Coinbase/iter_count work had to be manually cherry-picked to 4.5.2 because the local checkout was never switched).
+5. **BotManager deploy**: update `LUMIBOT_VERSION` variable, trigger dev then prod workflows.
+6. **Post-deploy**: verify `lumibot_version` in a backtest’s `settings.json` matches (via BotSpot MCP `start_backtest` + `get_backtest_artifact` with `label="settings.json"`).
+
+### What went wrong (2026-04-15 incident)
+During the flat-price bug investigation, the local checkout silently switched from `version/4.4.62` to `master`. This was not caught until the user noticed. The deploy itself was correct (all remote artifacts were on the right branch), but the local state was wrong. **Always verify your branch before and after every operation.**
+
+### The `master` branch is NOT used for active work
+`master` is a legacy branch used only for GitHub Pages. The active branches are `dev` (source of truth) and `version/X.Y.Z` (active work). If you find yourself on `master`, you are in the wrong place.
 
 ## AGENTS.md / CLAUDE.md Best Practices (how we keep instructions useful)
 - These instruction files are loaded automatically at session start, so keep guidance here **universal** and avoid dumping long, task-specific walls of text here.
@@ -285,9 +337,15 @@ BACKTESTING_DATA_SOURCE=none       # Uses whatever class the code specifies
 
 ### Cache Management
 
-If seeing wrong/stale data:
-1. Bump `LUMIBOT_CACHE_S3_VERSION` (e.g., v5 → v6)
+**LOCAL/DEV ONLY — if seeing wrong/stale data on your own machine or in dev:**
+1. Bump `LUMIBOT_CACHE_S3_VERSION` (e.g., v5 → v6) — invalidates everything, forces clean rebuild
 2. Clear local cache: `rm -rf ~/Library/Caches/lumibot/`
+
+**🚨 PRODUCTION — NEVER bump `LUMIBOT_CACHE_S3_VERSION`.** Doing so invalidates the entire prod cache including ThetaData option chains, which are extremely expensive to rewarm and will make the site/backtests painfully slow for a long time. For prod issues:
+- Prove bad data is actually *cached* (download a specific parquet and inspect) before deleting anything — the bug may be runtime-only
+- Use **surgical** `aws s3 rm --recursive` on the narrowest affected prefix (e.g., `s3://lumibot-cache-prod/prod/cache/v1/ibkr/stock/` or `.../ibkr/index/`)
+- It is OK to clear most of `prod/cache/v1/ibkr/` **except `ibkr/future/`** (futures cache is costly to rebuild)
+- Never touch `prod/cache/v1/thetadata/` — that data is clean and rebuilds are slow
 
 ## Common Tasks
 

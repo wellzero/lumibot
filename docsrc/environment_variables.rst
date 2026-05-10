@@ -166,6 +166,14 @@ BACKTESTING_PROFILE
 - Output:
   - Produces a ``*_profile_yappi.csv`` artifact alongside other backtest artifacts.
 
+LUMIBOT_CACHE_MISS_DEBUG
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Opt-in diagnostic logging for the IBKR history cache path. Emits ``[CACHE_MISS]`` (why a cache miss fired) and ``[FETCH]`` (including a short Python traceback of the caller) at WARNING level.
+- Values: truthy enables (``1``, ``true``); unset/``0`` disables.
+- Default: disabled. Zero runtime cost when unset — the check is gated before any logging work.
+- When to use: diagnosing unexpected IBKR roundtrips in warm-cache backtests (e.g., when profiling shows time in ``_fetch_history_between_dates`` that you expected to be cached).
+
 ThetaData option-chain building (performance)
 ---------------------------------------------
 
@@ -667,3 +675,39 @@ Notes:
 
 - Burst mode (more frequent telemetry logs) turns on automatically above ~80% of container memory.
 - Deep snapshots trigger above ~90% with a ~1 hour cooldown (these thresholds are fixed defaults today).
+
+AI agent model providers
+------------------------
+
+LumiBot's AI agent subsystem (``self.agents.create(default_model=...)``) supports multiple LLM providers. You only need the key matching the provider id you pass as ``default_model``. Non-Gemini ids are routed through LiteLLM, which ships as a LumiBot dependency.
+
+GEMINI_API_KEY
+^^^^^^^^^^^^^^
+
+- Purpose: Auth for Gemini models (the default provider).
+- Values: Obtain from https://aistudio.google.com/apikey.
+- Required when ``default_model`` starts with ``gemini-`` (e.g. ``gemini-3.1-flash-lite-preview``).
+
+OPENAI_API_KEY
+^^^^^^^^^^^^^^
+
+- Purpose: Auth for OpenAI models (GPT-5.4 family and others).
+- Values: Obtain from https://platform.openai.com/api-keys.
+- Required when ``default_model`` looks like ``openai/gpt-5.4-mini`` or any other ``openai/...`` id.
+
+XAI_API_KEY or GROK_API_KEY
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Auth for xAI Grok models.
+- Values: Obtain from https://console.x.ai/.
+- Required when ``default_model`` looks like ``xai/grok-4.20-0309-reasoning`` or any other ``xai/...`` id.
+- ``XAI_API_KEY`` is the canonical provider env var; ``GROK_API_KEY`` is also accepted for user-facing Grok naming.
+
+ANTHROPIC_API_KEY
+^^^^^^^^^^^^^^^^^
+
+- Purpose: Auth for Anthropic Claude models.
+- Values: Obtain from https://console.anthropic.com/.
+- Required when ``default_model`` looks like ``anthropic/claude-opus-4-7`` or any other ``anthropic/...`` id.
+
+Other providers (Groq, Mistral, Cohere, Fireworks, Together, etc.) use the provider-prefixed id format and the corresponding provider env var; see the LiteLLM documentation for the full list.
