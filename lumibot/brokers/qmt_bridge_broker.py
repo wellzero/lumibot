@@ -26,16 +26,14 @@ Example:
     >>> self.submit_order(order)
 """
 
-import threading
 import time
-from datetime import datetime
 from decimal import Decimal
 from typing import Union
 
 from lumibot.brokers.broker import Broker
+from lumibot.data_sources.qmt_bridge_data import qmt_bridge_denormalize_symbol, qmt_bridge_normalize_symbol
 from lumibot.entities import Asset, Order, Position
 from lumibot.tools.lumibot_logger import get_logger
-from lumibot.data_sources.qmt_bridge_data import qmt_bridge_normalize_symbol, qmt_bridge_denormalize_symbol
 
 logger = get_logger(__name__)
 
@@ -119,6 +117,7 @@ class QMTBridgeBroker(Broker):
         self.port = config.get("port", 8000)
         self._api_key = config.get("api_key", "")
         self.account_id = config.get("account_id", "")
+        self.paper = config.get("paper", False)
         self._client = None
 
         # Set market for Chinese exchanges (Shanghai Stock Exchange)
@@ -147,7 +146,8 @@ class QMTBridgeBroker(Broker):
                 self._client = QMTClient(
                     host=self.host,
                     port=self.port,
-                    api_key=self._api_key
+                    api_key=self._api_key,
+                    paper=self.paper,
                 )
             except ImportError as e:
                 raise ImportError(
@@ -344,10 +344,10 @@ class QMTBridgeBroker(Broker):
         try:
             result = client.query_positions(account_id=self.account_id)
 
-            if not result or "data" not in result:
+            if not result or "data" not in result or result["data"] is None:
                 return positions
 
-            for pos_data in result.get("data", []):
+            for pos_data in result["data"]:
                 position = self._parse_broker_position(pos_data, strategy)
                 if position and position.quantity != 0:
                     positions.append(position)
@@ -462,7 +462,7 @@ class QMTBridgeBroker(Broker):
         try:
             result = client.query_asset(account_id=self.account_id)
 
-            if not result or "data" not in result:
+            if not result or "data" not in result or result["data"] is None:
                 return (0.0, 0.0, 0.0)
 
             data = result["data"]
@@ -649,30 +649,38 @@ class QMTBridgeBroker(Broker):
     def _register_stream_events(self):
         """Register stream event handlers.
 
-        Subscribes to trade events via WebSocket.
+        The actual WebSocket subscription runs in _run_stream so the asyncio
+        event loop lives in the stream thread.
         """
-        client = self._get_client()
-
-        if hasattr(client, 'subscribe_trade_events'):
-            try:
-                # Subscribe to trade event callbacks
-                client.subscribe_trade_events(
-                    callback=self._on_trade_event_callback,
-                )
-                self._stream_established()
-                self.logger.info("Trade event stream registered")
-            except Exception as e:
-                self.logger.error(f"Error registering stream events: {e}")
+        pass
 
     def _run_stream(self):
         """Run the WebSocket stream.
 
-        Note: QMT Bridge WebSocket runs in background.
-        This method keeps the thread alive.
+        QMT Bridge's subscribe_trade_events is async and blocks while receiving
+        messages, so we run it with asyncio.run in the stream thread.
         """
         self.logger.info("QMT Bridge stream thread started")
 
-        # Keep thread alive to receive callbacks
+        client = self._get_client()
+        if hasattr(client, 'subscribe_trade_events'):
+            try:
+                import asyncio
+                self._stream_established()
+                self.logger.info("Trade event stream registered")
+                asyncio.run(
+                    client.subscribe_trade_events(
+                        callback=self._on_trade_event_callback,
+                    )
+                )
+            except Exception as e:
+                self.logger.error(f"Error in trade event stream: {e}")
+        else:
+            self.logger.warning(
+                "QMT Bridge client does not support trade event subscriptions"
+            )
+
+        # Keep thread alive if the stream drops
         while not self._stop_event.is_set():
             time.sleep(1)
 

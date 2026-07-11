@@ -382,7 +382,8 @@ QMT_BRIDGE_CONFIG = {
     "host": os.getenv("QMT_BRIDGE_HOST", "localhost"),
     "port":  int(os.getenv("QMT_BRIDGE_PORT", "8083")),
     "api_key":  os.getenv("QMT_BRIDGE_API_KEY", ""),
-    "account_id": os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", "")
+    "account_id": os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID", ""),
+    "paper": os.getenv("QMT_BRIDGE_PAPER", "false").lower() == "true",
 }
 
 # ProjectX URL mappings - REST API base URLs (v2 gateway URLs preferred)
